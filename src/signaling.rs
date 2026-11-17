@@ -188,6 +188,10 @@ impl Identity {
     }
 }
 
+/// How far (seconds) a peer's clock may differ from ours before relays start
+/// filtering out its messages. Relays apply `since` to live events too.
+const CLOCK_SKEW_SECS: u64 = 60;
+
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
@@ -322,7 +326,7 @@ async fn relay_session(
     let filter = json!({
         "kinds": [EVENT_KIND],
         "#t": [sig.room.topic],
-        "since": now_secs().saturating_sub(10),
+        "since": now_secs().saturating_sub(CLOCK_SKEW_SECS),
     });
     write.send(Message::text(json!(["REQ", "ptp", filter]).to_string())).await?;
     {
