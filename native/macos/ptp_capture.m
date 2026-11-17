@@ -249,6 +249,8 @@ int ptp_thumbnail(uint32_t kind, uint32_t sid, uint32_t max_w, uint32_t max_h, u
     uint32_t _windowId;
     double _scaleFactor;
     uint32_t _candW, _candH;
+    CGRect _crop, _candCrop;  // window-local points; CGRectNull = whole window
+    CGRect _defaultSourceRect;
     double _srcW, _srcH; // captured window size in pixels, from frame metadata
     int64_t _candSinceUs, _lastSizeCheckUs;
     // test pattern state
@@ -343,37 +345,79 @@ static void vt_output(void *refcon, void *frameRefcon, OSStatus status, VTEncode
 
 static void fit_size(double srcW, double srcH, uint32_t maxW, uint32_t maxH, uint32_t *w, uint32_t *h);
 
+static double backing_scale(CGDirectDisplayID did) {
+    for (NSScreen *scr in NSScreen.screens) {
+        NSNumber *n = scr.deviceDescription[@"NSScreenNumber"];
+        if (n && n.unsignedIntValue == did) return scr.backingScaleFactor;
+    }
+    return display_scale(did);
+}
+
 // Window sources: the stream size is fixed at start, so when the window is
 // resized ScreenCaptureKit shrinks it inside the old frame (black borders).
-// Follow the window instead: once a new size has been stable for 300 ms,
+// Follow the window instead: once a new geometry has been stable for 300 ms,
 // resize the capture and restart the encoder (viewers get a new keyframe).
-// The size comes from ScreenCaptureKit's own frame metadata (not the window
-// server), so it matches what is actually captured, including fullscreen
-// windows, scaled displays and windows moved between displays.
+//
+// Only the part of the window on the display it mostly sits on is streamed.
+// Fullscreen Chrome, for example, keeps its hidden toolbar ~120pt above the
+// top of the screen; capturing the whole window shows that as a black band.
 // Must be called on videoQueue.
 - (void)checkWindowSize {
     int64_t now = host_time_us();
     if (now - _lastSizeCheckUs < 100000) return;
     _lastSizeCheckUs = now;
-    if (_srcW < 16 || _srcH < 16) return;
+
+    CFArrayRef list = CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow, _windowId);
+    if (!list) return;
+    CGRect b = CGRectZero;
+    BOOL ok = NO;
+    if (CFArrayGetCount(list) > 0) {
+        CFDictionaryRef bd = CFDictionaryGetValue(CFArrayGetValueAtIndex(list, 0), kCGWindowBounds);
+        ok = bd && CGRectMakeWithDictionaryRepresentation(bd, &b);
+    }
+    CFRelease(list);
+    if (!ok || b.size.width < 8 || b.size.height < 8) return;
+
+    // Display holding the largest part of the window.
+    CGDirectDisplayID ids[16];
+    uint32_t count = 0;
+    CGGetActiveDisplayList(16, ids, &count);
+    CGRect vis = b;
+    double bestArea = 0, sc = _scaleFactor > 0 ? _scaleFactor : 1.0;
+    for (uint32_t i = 0; i < count; i++) {
+        CGRect inter = CGRectIntersection(b, CGDisplayBounds(ids[i]));
+        double area = CGRectIsNull(inter) ? 0 : inter.size.width * inter.size.height;
+        if (area > bestArea) {
+            bestArea = area;
+            vis = inter;
+            sc = backing_scale(ids[i]);
+        }
+    }
+    vis = CGRectIntegral(vis);
+    if (vis.size.width < 8 || vis.size.height < 8) return;
+    CGRect crop = CGRectEqualToRect(vis, CGRectIntegral(b))
+                      ? CGRectNull
+                      : CGRectMake(vis.origin.x - b.origin.x, vis.origin.y - b.origin.y, vis.size.width, vis.size.height);
+
     uint32_t nw, nh;
-    fit_size(_srcW, _srcH, _cfg.max_width, _cfg.max_height, &nw, &nh);
-    if (nw == _width && nh == _height) {
+    fit_size(vis.size.width * sc, vis.size.height * sc, _cfg.max_width, _cfg.max_height, &nw, &nh);
+    if (nw == _width && nh == _height && CGRectEqualToRect(crop, _crop)) {
         _candW = _candH = 0;
         return;
     }
-    if (nw != _candW || nh != _candH) {
+    if (nw != _candW || nh != _candH || !CGRectEqualToRect(crop, _candCrop)) {
         _candW = nw;
         _candH = nh;
+        _candCrop = crop;
         _candSinceUs = now;
         return;
     }
     if (now - _candSinceUs < 300000) return;
     _candW = _candH = 0;
-    [self resizeTo:nw height:nh];
+    [self resizeTo:nw height:nh crop:crop];
 }
 
-- (void)resizeTo:(uint32_t)w height:(uint32_t)h {
+- (void)resizeTo:(uint32_t)w height:(uint32_t)h crop:(CGRect)crop {
     uint32_t oldW = _width, oldH = _height;
     if (_vt) {
         VTCompressionSessionCompleteFrames(_vt, kCMTimeInvalid);
@@ -391,11 +435,15 @@ static void fit_size(double srcW, double srcH, uint32_t maxW, uint32_t maxH, uin
         [self setupEncoderWithError:&e];
         return;
     }
+    _crop = crop;
     atomic_store(&_forceKey, true);
     [self rememberFrame:NULL];
     SCStreamConfiguration *c = self.videoConfig;
     c.width = w;
     c.height = h;
+    c.sourceRect = CGRectIsNull(crop) ? _defaultSourceRect : crop;
+    if (getenv("PTP_DEBUG"))
+        fprintf(stderr, "dbg resize %ux%u crop %.0f,%.0f %.0fx%.0f\n", w, h, crop.origin.x, crop.origin.y, crop.size.width, crop.size.height);
     [self.videoStream updateConfiguration:c completionHandler:^(NSError *err) {
         if (err) NSLog(@"ptp: resize to %ux%u failed: %@", w, h, err);
     }];
@@ -761,6 +809,9 @@ void *ptp_start(const ptp_config *cfg, uint32_t *out_width, uint32_t *out_height
         vc.capturesAudio = NO;
         vc.scalesToFit = YES;
         s.videoConfig = vc;
+        s->_defaultSourceRect = vc.sourceRect;
+        s->_crop = CGRectNull;
+        s->_candCrop = CGRectNull;
         s->_isWindow = cfg->source_kind == PTP_SOURCE_WINDOW;
         s->_windowId = cfg->source_id;
         s.videoStream = [[SCStream alloc] initWithFilter:vfilter configuration:vc delegate:s];
