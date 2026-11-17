@@ -67,6 +67,17 @@ cargo run -- --test-pattern http://localhost:8080/  # local viewer
 
 This streams moving color bars plus a beep, and prints the room link.
 
+To stream your real main display and system audio without the UI (useful for
+checking quality), launch the bundle so it uses the app's Screen Recording
+permission:
+
+```bash
+open -n --stdout /dev/stdout target/release/ptp-share.app --args --display http://localhost:8080/
+```
+
+It prints the room link plus audio bitrate, packets per second and dropped
+audio chunks every 5 seconds.
+
 ## Layout
 
 | Path | What |

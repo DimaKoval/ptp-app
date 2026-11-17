@@ -23,4 +23,7 @@ pub struct Stats {
     pub video_frames: AtomicU64,
     pub keyframes: AtomicU64,
     pub audio_bytes: AtomicU64,
+    pub audio_packets: AtomicU64,
+    /// PCM chunks dropped because the encoder thread fell behind.
+    pub audio_pcm_dropped: AtomicU64,
 }

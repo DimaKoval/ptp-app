@@ -153,6 +153,7 @@ impl HostSession {
         let video_stats = stats.clone();
         let last_pts = Mutex::new(None::<i64>);
         let frame_us = 1_000_000 / fps.max(1) as i64;
+        let audio_stats = stats.clone();
         let err_slot = error_slot.clone();
         let callbacks = Callbacks {
             video: Box::new(move |data, pts, key| {
@@ -175,8 +176,8 @@ impl HostSession {
                 });
             }),
             audio: Box::new(move |samples, rate, _pts, mic| {
-                if has_audio {
-                    let _ = pcm_tx.try_send(audio::Pcm { samples: samples.to_vec(), rate, mic });
+                if has_audio && pcm_tx.try_send(audio::Pcm { samples: samples.to_vec(), rate, mic }).is_err() {
+                    audio_stats.audio_pcm_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }),
             error: Box::new(move |msg| {

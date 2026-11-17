@@ -74,7 +74,13 @@ pub fn spawn_encoder(
                     return;
                 }
             };
+            // Tuned for music/game/video audio rather than speech: 160 kbps
+            // stereo Opus is near-transparent and tiny next to the video.
             let _ = enc.set_bitrate(opus::Bitrate::Bits(160_000));
+            let _ = enc.set_signal(opus::Signal::Music);
+            let _ = enc.set_bandwidth(opus::Bandwidth::Fullband);
+            let _ = enc.set_complexity(10);
+            let _ = enc.set_lsb_depth(24);
             let mut sys_q: VecDeque<f32> = VecDeque::new();
             let mut mic_q: VecDeque<f32> = VecDeque::new();
             let mut sys_rs = Resampler::new();
@@ -122,6 +128,7 @@ pub fn spawn_encoder(
                     match enc.encode_float(&frame, &mut buf) {
                         Ok(len) => {
                             stats.audio_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                            stats.audio_packets.fetch_add(1, Ordering::Relaxed);
                             let _ = out.send(MediaPacket {
                                 kind: MediaKind::Audio,
                                 data: Bytes::copy_from_slice(&buf[..len]),
