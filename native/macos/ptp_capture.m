@@ -249,6 +249,7 @@ int ptp_thumbnail(uint32_t kind, uint32_t sid, uint32_t max_w, uint32_t max_h, u
     uint32_t _windowId;
     double _scaleFactor;
     uint32_t _candW, _candH;
+    double _srcW, _srcH; // captured window size in pixels, from frame metadata
     int64_t _candSinceUs, _lastSizeCheckUs;
     // test pattern state
     CVPixelBufferPoolRef _pool;
@@ -346,26 +347,17 @@ static void fit_size(double srcW, double srcH, uint32_t maxW, uint32_t maxH, uin
 // resized ScreenCaptureKit shrinks it inside the old frame (black borders).
 // Follow the window instead: once a new size has been stable for 300 ms,
 // resize the capture and restart the encoder (viewers get a new keyframe).
+// The size comes from ScreenCaptureKit's own frame metadata (not the window
+// server), so it matches what is actually captured, including fullscreen
+// windows, scaled displays and windows moved between displays.
 // Must be called on videoQueue.
 - (void)checkWindowSize {
     int64_t now = host_time_us();
     if (now - _lastSizeCheckUs < 100000) return;
     _lastSizeCheckUs = now;
-    CFArrayRef list = CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow, _windowId);
-    if (!list) return;
-    CGRect bounds = CGRectZero;
-    BOOL ok = NO;
-    if (CFArrayGetCount(list) > 0) {
-        CFDictionaryRef info = CFArrayGetValueAtIndex(list, 0);
-        CFDictionaryRef b = CFDictionaryGetValue(info, kCGWindowBounds);
-        ok = b && CGRectMakeWithDictionaryRepresentation(b, &bounds);
-    }
-    CFRelease(list);
-    if (!ok || bounds.size.width < 1 || bounds.size.height < 1) return;
-
-    double sc = _scaleFactor > 0 ? _scaleFactor : display_scale(CGMainDisplayID());
+    if (_srcW < 16 || _srcH < 16) return;
     uint32_t nw, nh;
-    fit_size(bounds.size.width * sc, bounds.size.height * sc, _cfg.max_width, _cfg.max_height, &nw, &nh);
+    fit_size(_srcW, _srcH, _cfg.max_width, _cfg.max_height, &nw, &nh);
     if (nw == _width && nh == _height) {
         _candW = _candH = 0;
         return;
@@ -420,8 +412,31 @@ static void fit_size(double srcW, double srcH, uint32_t maxW, uint32_t maxH, uin
         if (!status || status.integerValue != SCFrameStatusComplete) return;
         NSNumber *scale = a[SCStreamFrameInfoScaleFactor];
         if (scale.doubleValue > 0) _scaleFactor = scale.doubleValue;
+        if (_isWindow) {
+            // contentRect (points, inside the output) / contentScale = window size
+            // in points; × scaleFactor = window size in pixels.
+            CGRect cr = CGRectZero;
+            CFDictionaryRef crd = (__bridge CFDictionaryRef)a[SCStreamFrameInfoContentRect];
+            double cs = [a[SCStreamFrameInfoContentScale] doubleValue];
+            if (crd && CGRectMakeWithDictionaryRepresentation(crd, &cr) && cs > 0 && _scaleFactor > 0) {
+                _srcW = cr.size.width / cs * _scaleFactor;
+                _srcH = cr.size.height / cs * _scaleFactor;
+            }
+        }
         CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
         if (!pb) return;
+        static int dbg = -1;
+        if (dbg < 0) dbg = getenv("PTP_DEBUG") != NULL;
+        static uint64_t n = 0;
+        if (dbg && (n++ % 60) == 0) {
+            CGRect cr = CGRectZero;
+            CFDictionaryRef crd = (__bridge CFDictionaryRef)a[SCStreamFrameInfoContentRect];
+            if (crd) CGRectMakeWithDictionaryRepresentation(crd, &cr);
+            fprintf(stderr, "dbg buf %zux%zu cfg %ux%u contentRect %.0f,%.0f %.0fx%.0f contentScale %.3f scaleFactor %.2f window px %.0fx%.0f\n",
+                    CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb), _width, _height, cr.origin.x, cr.origin.y,
+                    cr.size.width, cr.size.height, [a[SCStreamFrameInfoContentScale] doubleValue], scale.doubleValue,
+                    _srcW, _srcH);
+        }
         [self rememberFrame:pb];
         [self encode:pb];
         return;
