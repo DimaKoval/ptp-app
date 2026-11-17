@@ -161,12 +161,6 @@ fn badge(ui: &mut egui::Ui, text: &str, color: Color32) {
 
 // ───────────────────────────── app ─────────────────────────────
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Tab {
-    Screens,
-    Windows,
-}
-
 type ThumbKey = (SourceKind, u32);
 
 enum StartResult {
@@ -177,7 +171,6 @@ enum StartResult {
 struct App {
     rt: tokio::runtime::Runtime,
     settings: Settings,
-    tab: Tab,
     sources: SourceList,
     sources_rx: Option<Receiver<Result<SourceList, String>>>,
     selected: Option<(SourceKind, u32, String)>,
@@ -225,7 +218,6 @@ impl App {
             rt,
             live_bitrate: settings.bitrate_mbps,
             settings,
-            tab: Tab::Screens,
             sources: SourceList::default(),
             sources_rx: None,
             selected: None,
@@ -472,27 +464,15 @@ impl App {
                 }
             });
         });
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.set_max_width(320.0);
-            segmented(
-                ui,
-                &mut self.tab,
-                &[
-                    (Tab::Screens, format!("{}  Screens ({})", icon::MONITOR, self.sources.displays.len())),
-                    (Tab::Windows, format!("{}  Windows ({})", icon::APP_WINDOW, self.sources.windows.len())),
-                ],
-            );
-        });
-        if self.tab == Tab::Windows {
-            ui.add_space(4.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut self.window_filter)
-                    .hint_text(format!("{}  Filter windows…", icon::MAGNIFYING_GLASS))
-                    .desired_width(320.0),
-            );
-        }
         ui.add_space(8.0);
+        ui.add(
+            egui::TextEdit::singleline(&mut self.window_filter)
+                .hint_text(format!("{}  Filter screens and windows…", icon::MAGNIFYING_GLASS))
+                .margin(egui::Margin::symmetric(12, 9))
+                .font(FontId::proportional(14.0))
+                .desired_width(360.0),
+        );
+        ui.add_space(12.0);
 
         struct Item {
             key: ThumbKey,
@@ -500,62 +480,83 @@ impl App {
             subtitle: String,
             label: String,
         }
-        let items: Vec<Item> = match self.tab {
-            Tab::Screens => self
-                .sources
-                .displays
-                .iter()
-                .map(|d| Item {
-                    key: (SourceKind::Display, d.id),
-                    title: d.name.clone(),
-                    subtitle: format!("{} × {}", d.width, d.height),
-                    label: d.name.clone(),
-                })
-                .collect(),
-            Tab::Windows => {
-                let f = self.window_filter.to_lowercase();
-                self.sources
-                    .windows
-                    .iter()
-                    .filter(|w| f.is_empty() || w.title.to_lowercase().contains(&f) || w.app_name.to_lowercase().contains(&f))
-                    .map(|w| {
-                        let title = if w.title.is_empty() { w.app_name.clone() } else { w.title.clone() };
-                        Item {
-                            key: (SourceKind::Window, w.id),
-                            subtitle: format!("{} · {} × {}", w.app_name, w.width, w.height),
-                            label: format!("{} — {}", w.app_name, title),
-                            title,
-                        }
-                    })
-                    .collect()
-            }
-        };
+        let f = self.window_filter.to_lowercase();
+        let screens: Vec<Item> = self
+            .sources
+            .displays
+            .iter()
+            .filter(|d| f.is_empty() || d.name.to_lowercase().contains(&f))
+            .map(|d| Item {
+                key: (SourceKind::Display, d.id),
+                title: d.name.clone(),
+                subtitle: format!("{} × {}", d.width, d.height),
+                label: d.name.clone(),
+            })
+            .collect();
+        let windows: Vec<Item> = self
+            .sources
+            .windows
+            .iter()
+            .filter(|w| f.is_empty() || w.title.to_lowercase().contains(&f) || w.app_name.to_lowercase().contains(&f))
+            .map(|w| {
+                let title = if w.title.is_empty() { w.app_name.clone() } else { w.title.clone() };
+                Item {
+                    key: (SourceKind::Window, w.id),
+                    subtitle: format!("{} · {} × {}", w.app_name, w.width, w.height),
+                    label: format!("{} — {}", w.app_name, title),
+                    title,
+                }
+            })
+            .collect();
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            if items.is_empty() {
+            if screens.is_empty() && windows.is_empty() {
                 ui.add_space(40.0);
                 ui.vertical_centered(|ui| {
                     ui.label(RichText::new(icon::SELECTION_SLASH).size(40.0).color(MUTED));
-                    ui.label(RichText::new("Nothing to show here").color(MUTED));
+                    ui.label(RichText::new("Nothing matches").color(MUTED));
                 });
             }
             let card_w = 236.0;
             let cols = ((ui.available_width() + 12.0) / (card_w + 12.0)).floor().max(1.0) as usize;
-            for row in items.chunks(cols) {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 12.0;
-                    for item in row {
-                        let selected = self.selected.as_ref().map(|s| (s.0, s.1)) == Some(item.key);
-                        let resp = self.source_card(ui, item.key, &item.title, &item.subtitle, selected, card_w);
-                        if resp.clicked() {
-                            self.selected = Some((item.key.0, item.key.1, item.label.clone()));
+            for (ic, name, items) in [(icon::MONITOR, "Screens", &screens), (icon::APP_WINDOW, "Windows", &windows)] {
+                if items.is_empty() {
+                    continue;
+                }
+                ui.label(
+                    RichText::new(format!("{ic}  {name}  ·  {}", items.len()))
+                        .size(14.0)
+                        .strong()
+                        .color(MUTED),
+                );
+                if name == "Windows" {
+                    ui.label(
+                        RichText::new(format!(
+                            "{}  Don't minimize the window you share: macOS stops drawing minimized windows, so viewers \
+                             would see a frozen picture. Covering it with other windows is fine.",
+                            icon::INFO
+                        ))
+                        .size(12.0)
+                        .color(MUTED),
+                    );
+                }
+                ui.add_space(6.0);
+                for row in items.chunks(cols) {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
+                        for item in row {
+                            let selected = self.selected.as_ref().map(|s| (s.0, s.1)) == Some(item.key);
+                            let resp = self.source_card(ui, item.key, &item.title, &item.subtitle, selected, card_w);
+                            if resp.clicked() {
+                                self.selected = Some((item.key.0, item.key.1, item.label.clone()));
+                            }
                         }
-                    }
-                });
-                ui.add_space(4.0);
+                    });
+                    ui.add_space(4.0);
+                }
+                ui.add_space(14.0);
             }
             if cfg!(debug_assertions) || std::env::var("PTP_TEST_PATTERN").is_ok() {
-                ui.add_space(8.0);
                 let selected = matches!(self.selected, Some((SourceKind::TestPattern, ..)));
                 if ui.selectable_label(selected, format!("{}  Test pattern (debug)", icon::FLASK)).clicked() {
                     self.selected = Some((SourceKind::TestPattern, 0, "Test pattern".into()));

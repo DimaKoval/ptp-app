@@ -584,9 +584,12 @@ static double backing_scale(CGDirectDisplayID did) {
 
     // ScreenCaptureKit can capture more than the window server reports: a
     // fullscreen Chrome window is ~124pt taller than its bounds, with the extra
-    // (its hidden toolbar, rendered black) at the top. Measure that from the
-    // uncropped frames and crop it off together with any off-screen part.
+    // (its hidden toolbar, rendered black) at the top. A fullscreen window on a
+    // display left of the main one (negative x origin) is also padded on the
+    // right by that offset (5120pt wide captured as 6661pt). Measure both from
+    // the uncropped frames and crop them off with any off-screen part.
     double extraTop;
+    BOOL extraRight = NO;
     if (!CGRectIsNull(_crop)) {
         if (!CGRectEqualToRect(b, _cropBounds)) {
             // The window changed while cropped. Frames only show the cropped
@@ -594,15 +597,18 @@ static double backing_scale(CGDirectDisplayID did) {
             vis = b;
             extraTop = -1;
         } else {
-            extraTop = _cropExtraTop;
+            _candW = _candH = 0;
+            return; // same window, crop still valid
         }
     } else {
-        if (_fullPtsW < 8 || fabs(_fullPtsW - b.size.width) > 2) return; // frames not caught up yet
+        // Captured smaller than the window: frames haven't caught up yet.
+        if (_fullPtsW < b.size.width - 2 || _fullPtsH < b.size.height - 2) return;
         extraTop = _fullPtsH - b.size.height;
         if (extraTop < 2) extraTop = 0;
+        extraRight = _fullPtsW > b.size.width + 2;
     }
     CGRect crop = CGRectNull;
-    if (extraTop > 0 || (extraTop == 0 && !CGRectEqualToRect(vis, b)))
+    if (extraTop > 0 || extraRight || (extraTop == 0 && !CGRectEqualToRect(vis, b)))
         crop = CGRectMake(vis.origin.x - b.origin.x, vis.origin.y - b.origin.y + extraTop, vis.size.width, vis.size.height);
 
     uint32_t nw, nh;
@@ -622,6 +628,9 @@ static double backing_scale(CGDirectDisplayID did) {
     _candW = _candH = 0;
     _cropBounds = b;
     _cropExtraTop = extraTop > 0 ? extraTop : 0;
+    if (getenv("PTP_DEBUG"))
+        fprintf(stderr, "dbg window bounds %.0f,%.0f %.0fx%.0f captured %.0fx%.0f\n", b.origin.x, b.origin.y, b.size.width,
+                b.size.height, _fullPtsW, _fullPtsH);
     [self resizeTo:nw height:nh crop:crop];
 }
 
