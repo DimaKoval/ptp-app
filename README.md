@@ -75,7 +75,8 @@ permission:
 open -n --stdout /dev/stdout target/release/ptp-share.app --args --display http://localhost:8080/
 ```
 
-It prints the room link plus audio bitrate, packets per second and dropped
+`--window <app name>` does the same for the first window of that app (handy for
+testing resizes). It prints the room link plus audio bitrate, packets per second and dropped
 audio chunks every 5 seconds.
 
 ## Layout

@@ -244,6 +244,12 @@ int ptp_thumbnail(uint32_t kind, uint32_t sid, uint32_t max_w, uint32_t max_h, u
     int64_t _lastEncodeUs;
     int64_t _lastPtsUs;
     uint32_t _width, _height;
+    // window sources: follow the window's size
+    BOOL _isWindow;
+    uint32_t _windowId;
+    double _scaleFactor;
+    uint32_t _candW, _candH;
+    int64_t _candSinceUs, _lastSizeCheckUs;
     // test pattern state
     CVPixelBufferPoolRef _pool;
     uint64_t _frameNo;
@@ -252,6 +258,7 @@ int ptp_thumbnail(uint32_t kind, uint32_t sid, uint32_t max_w, uint32_t max_h, u
     uint64_t _audioFramesSent;
 }
 @property(strong) SCStream *videoStream;
+@property(strong) SCStreamConfiguration *videoConfig;
 @property(strong) SCStream *audioStream;
 @property(strong) dispatch_queue_t videoQueue;
 @property(strong) dispatch_queue_t audioQueue;
@@ -304,6 +311,8 @@ static void vt_output(void *refcon, void *frameRefcon, OSStatus status, VTEncode
 // Must be called on videoQueue.
 - (void)encode:(CVPixelBufferRef)pb {
     if (atomic_load(&_stopped) || !_vt || !pb) return;
+    // Right after a resize, a few frames may still arrive at the old size.
+    if (CVPixelBufferGetWidth(pb) != _width || CVPixelBufferGetHeight(pb) != _height) return;
     int64_t now = host_time_us();
     int64_t pts = now;
     if (pts <= _lastPtsUs) pts = _lastPtsUs + 1000;
@@ -324,9 +333,80 @@ static void vt_output(void *refcon, void *frameRefcon, OSStatus status, VTEncode
 // Static content produces no new frames from ScreenCaptureKit. Re-encode the
 // last frame so new viewers / keyframe requests still get a picture.
 - (void)tick {
-    if (atomic_load(&_stopped) || !_lastFrame) return;
+    if (atomic_load(&_stopped)) return;
+    if (_isWindow) [self checkWindowSize];
+    if (!_lastFrame) return;
     int64_t idle = host_time_us() - _lastEncodeUs;
     if (idle > 500000 || (atomic_load(&_forceKey) && idle > 40000)) [self encode:_lastFrame];
+}
+
+static void fit_size(double srcW, double srcH, uint32_t maxW, uint32_t maxH, uint32_t *w, uint32_t *h);
+
+// Window sources: the stream size is fixed at start, so when the window is
+// resized ScreenCaptureKit shrinks it inside the old frame (black borders).
+// Follow the window instead: once a new size has been stable for 300 ms,
+// resize the capture and restart the encoder (viewers get a new keyframe).
+// Must be called on videoQueue.
+- (void)checkWindowSize {
+    int64_t now = host_time_us();
+    if (now - _lastSizeCheckUs < 100000) return;
+    _lastSizeCheckUs = now;
+    CFArrayRef list = CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow, _windowId);
+    if (!list) return;
+    CGRect bounds = CGRectZero;
+    BOOL ok = NO;
+    if (CFArrayGetCount(list) > 0) {
+        CFDictionaryRef info = CFArrayGetValueAtIndex(list, 0);
+        CFDictionaryRef b = CFDictionaryGetValue(info, kCGWindowBounds);
+        ok = b && CGRectMakeWithDictionaryRepresentation(b, &bounds);
+    }
+    CFRelease(list);
+    if (!ok || bounds.size.width < 1 || bounds.size.height < 1) return;
+
+    double sc = _scaleFactor > 0 ? _scaleFactor : display_scale(CGMainDisplayID());
+    uint32_t nw, nh;
+    fit_size(bounds.size.width * sc, bounds.size.height * sc, _cfg.max_width, _cfg.max_height, &nw, &nh);
+    if (nw == _width && nh == _height) {
+        _candW = _candH = 0;
+        return;
+    }
+    if (nw != _candW || nh != _candH) {
+        _candW = nw;
+        _candH = nh;
+        _candSinceUs = now;
+        return;
+    }
+    if (now - _candSinceUs < 300000) return;
+    _candW = _candH = 0;
+    [self resizeTo:nw height:nh];
+}
+
+- (void)resizeTo:(uint32_t)w height:(uint32_t)h {
+    uint32_t oldW = _width, oldH = _height;
+    if (_vt) {
+        VTCompressionSessionCompleteFrames(_vt, kCMTimeInvalid);
+        VTCompressionSessionInvalidate(_vt);
+        CFRelease(_vt);
+        _vt = NULL;
+    }
+    _width = w;
+    _height = h;
+    NSString *e = nil;
+    if (![self setupEncoderWithError:&e]) {
+        // Fall back to the old size rather than stopping the stream.
+        _width = oldW;
+        _height = oldH;
+        [self setupEncoderWithError:&e];
+        return;
+    }
+    atomic_store(&_forceKey, true);
+    [self rememberFrame:NULL];
+    SCStreamConfiguration *c = self.videoConfig;
+    c.width = w;
+    c.height = h;
+    [self.videoStream updateConfiguration:c completionHandler:^(NSError *err) {
+        if (err) NSLog(@"ptp: resize to %ux%u failed: %@", w, h, err);
+    }];
 }
 
 - (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sb ofType:(SCStreamOutputType)type {
@@ -338,6 +418,8 @@ static void vt_output(void *refcon, void *frameRefcon, OSStatus status, VTEncode
         NSDictionary *a = (__bridge NSDictionary *)CFArrayGetValueAtIndex(atts, 0);
         NSNumber *status = a[SCStreamFrameInfoStatus];
         if (!status || status.integerValue != SCFrameStatusComplete) return;
+        NSNumber *scale = a[SCStreamFrameInfoScaleFactor];
+        if (scale.doubleValue > 0) _scaleFactor = scale.doubleValue;
         CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
         if (!pb) return;
         [self rememberFrame:pb];
@@ -663,6 +745,9 @@ void *ptp_start(const ptp_config *cfg, uint32_t *out_width, uint32_t *out_height
         vc.showsCursor = YES;
         vc.capturesAudio = NO;
         vc.scalesToFit = YES;
+        s.videoConfig = vc;
+        s->_isWindow = cfg->source_kind == PTP_SOURCE_WINDOW;
+        s->_windowId = cfg->source_id;
         s.videoStream = [[SCStream alloc] initWithFilter:vfilter configuration:vc delegate:s];
         if (![s.videoStream addStreamOutput:s type:SCStreamOutputTypeScreen sampleHandlerQueue:s.videoQueue error:&ne]) {
             set_err(err, err_len, ne.localizedDescription);

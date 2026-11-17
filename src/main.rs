@@ -18,14 +18,27 @@ fn main() -> anyhow::Result<()> {
     //   --test-pattern [viewer_url]  synthetic bars + beep, no permission needed
     //   --display [viewer_url]       main display + system audio (needs permission,
     //                                so launch the .app: open -n ptp-share.app --args --display)
-    let args: Vec<String> = std::env::args().collect();
-    let mode = args.get(1).map(|s| s.as_str());
-    if mode == Some("--test-pattern") || mode == Some("--display") {
+    //   --window <app> [viewer_url]  first window of an app whose name contains <app>
+    let mut args: Vec<String> = std::env::args().collect();
+    let mode = args.get(1).cloned();
+    let mode = mode.as_deref();
+    let window_app = if mode == Some("--window") && args.len() > 2 { Some(args.remove(2)) } else { None };
+    if matches!(mode, Some("--test-pattern" | "--display" | "--window")) {
         let mut settings = Settings::load();
         if let Some(url) = args.get(2) {
             settings.viewer_url = url.clone();
         }
-        let source = if mode == Some("--display") {
+        let source = if let Some(app) = window_app {
+            let list = capture::list_sources()?;
+            let needle = app.to_lowercase();
+            let w = list
+                .windows
+                .iter()
+                .find(|w| w.app_name.to_lowercase().contains(&needle))
+                .ok_or_else(|| anyhow::anyhow!("no window for app {app}"))?;
+            println!("Window {} \"{}\" ({})", w.id, w.title, w.app_name);
+            SourceSelection { kind: SourceKind::Window, id: w.id, label: w.title.clone() }
+        } else if mode == Some("--display") {
             let list = capture::list_sources()?;
             let d = list.displays.iter().find(|d| d.is_main).or(list.displays.first()).ok_or_else(|| anyhow::anyhow!("no display"))?;
             SourceSelection { kind: SourceKind::Display, id: d.id, label: d.name.clone() }
