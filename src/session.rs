@@ -10,6 +10,7 @@ use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use rtc::interceptor::{Registry, Slot};
 use rtc::media::Sample;
+use rtc::rtp::packetizer::Packetizer;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
@@ -173,6 +174,7 @@ impl HostSession {
                     data: Bytes::copy_from_slice(data),
                     duration: Duration::from_micros(dur_us as u64),
                     keyframe: key,
+                    pts_us: pts,
                 });
             }),
             audio: Box::new(move |samples, rate, _pts, mic| {
@@ -632,6 +634,23 @@ async fn drive_peer(
         });
     }
 
+    // Video is packetized here rather than with write_sample: the sample API
+    // stamps each frame with the sum of the *previous* frames' durations, so
+    // unevenly spaced frames (a 24/30 fps video on a 60 Hz screen) got each
+    // other's timing and played back with a judder. Here every frame's RTP
+    // timestamp is its own capture time.
+    let mut vpack = rtc::rtp::packetizer::new_packetizer(
+        Instant::now(),
+        1200,
+        vpt,
+        vssrc,
+        video_codecs()[0].rtp_codec.payloader()?,
+        Box::new(rtc::rtp::sequence::new_random_sequencer()),
+        90_000,
+    );
+    let mut video_base: Option<i64> = None; // pts of the first frame sent
+    let mut video_ticks: u64 = 0; // 90 kHz ticks advanced so far
+
     let mut media_rx = shared.media_tx.subscribe();
     shared.request_keyframe();
     let mut waiting_for_key = true;
@@ -644,9 +663,22 @@ async fn drive_peer(
                             continue;
                         }
                         waiting_for_key = false;
-                        let sample = Sample { data: p.data, duration: p.duration, ..Sample::new(Instant::now()) };
-                        if let Err(e) = video_track.sample_writer(vssrc, vpt).write_sample(&sample).await {
-                            eprintln!("viewer {sid}: video write: {e}");
+                        let base = *video_base.get_or_insert(p.pts_us);
+                        let target = ((p.pts_us - base).max(0) as u64) * 90_000 / 1_000_000;
+                        if target > video_ticks {
+                            vpack.skip_samples((target - video_ticks) as u32);
+                            video_ticks = target;
+                        }
+                        match vpack.packetize(Instant::now(), &p.data, 0) {
+                            Ok(packets) => {
+                                for pkt in packets {
+                                    if let Err(e) = video_track.write_rtp(pkt).await {
+                                        eprintln!("viewer {sid}: video write: {e}");
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => eprintln!("viewer {sid}: packetize: {e}"),
                         }
                     }
                     MediaKind::Audio => {

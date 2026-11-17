@@ -134,6 +134,7 @@ pub fn spawn_encoder(
                                 data: Bytes::copy_from_slice(&buf[..len]),
                                 duration: Duration::from_millis(20),
                                 keyframe: false,
+                                pts_us: 0,
                             });
                         }
                         Err(e) => eprintln!("opus encode: {e}"),

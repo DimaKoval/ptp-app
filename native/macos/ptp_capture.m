@@ -243,7 +243,18 @@ int ptp_thumbnail(uint32_t kind, uint32_t sid, uint32_t max_w, uint32_t max_h, u
     CVPixelBufferRef _lastFrame;
     int64_t _lastEncodeUs;
     int64_t _lastPtsUs;
-    uint32_t _width, _height;
+    uint32_t _width, _height;   // capture size
+    // Letterbox removal: black bars inside the captured picture are cropped
+    // off on the GPU before encoding. The capture itself stays uncropped so
+    // the bars can be re-checked (and the crop undone) at any time.
+    BOOL _lbOn;
+    CGRect _lb;                  // crop in capture pixels
+    uint32_t _encW, _encH;       // encoder size while _lbOn
+    VTPixelTransferSessionRef _xfer;
+    CVPixelBufferPoolRef _lbPool;
+    int _lbT[12], _lbB[12], _lbL[12], _lbR[12];
+    int _lbN, _lbPos;
+    int64_t _lbLastUs;
     // window sources: follow the window's size
     BOOL _isWindow;
     uint32_t _windowId;
@@ -273,20 +284,27 @@ int ptp_thumbnail(uint32_t kind, uint32_t sid, uint32_t max_w, uint32_t max_h, u
 @end
 
 static void vt_output(void *refcon, void *frameRefcon, OSStatus status, VTEncodeInfoFlags flags, CMSampleBufferRef sb);
+static void fit_size(double srcW, double srcH, uint32_t maxW, uint32_t maxH, uint32_t *w, uint32_t *h);
 
 @implementation PTPSession
 
 - (void)dealloc {
     if (_lastFrame) CVPixelBufferRelease(_lastFrame);
     if (_pool) CVPixelBufferPoolRelease(_pool);
+    if (_lbPool) CVPixelBufferPoolRelease(_lbPool);
+    if (_xfer) {
+        VTPixelTransferSessionInvalidate(_xfer);
+        CFRelease(_xfer);
+    }
 }
 
 - (BOOL)setupEncoderWithError:(NSString **)error {
     NSDictionary *spec = @{(id)kVTVideoEncoderSpecification_EnableLowLatencyRateControl : @YES};
-    OSStatus s = VTCompressionSessionCreate(NULL, _width, _height, kCMVideoCodecType_H264, (__bridge CFDictionaryRef)spec,
+    uint32_t ew = _lbOn ? _encW : _width, eh = _lbOn ? _encH : _height;
+    OSStatus s = VTCompressionSessionCreate(NULL, ew, eh, kCMVideoCodecType_H264, (__bridge CFDictionaryRef)spec,
                                             NULL, NULL, vt_output, (__bridge void *)self, &_vt);
     if (s != noErr) {
-        s = VTCompressionSessionCreate(NULL, _width, _height, kCMVideoCodecType_H264, NULL, NULL, NULL, vt_output,
+        s = VTCompressionSessionCreate(NULL, ew, eh, kCMVideoCodecType_H264, NULL, NULL, NULL, vt_output,
                                        (__bridge void *)self, &_vt);
     }
     if (s != noErr) {
@@ -316,18 +334,182 @@ static void vt_output(void *refcon, void *frameRefcon, OSStatus status, VTEncode
 
 // Must be called on videoQueue.
 - (void)encode:(CVPixelBufferRef)pb {
+    [self encode:pb pts:host_time_us()];
+}
+
+// pts: capture time (host clock, µs). It becomes the frame's RTP timestamp,
+// so viewers play frames back with the same spacing they were captured with.
+- (void)encode:(CVPixelBufferRef)pb pts:(int64_t)capturePts {
     if (atomic_load(&_stopped) || !_vt || !pb) return;
     // Right after a resize, a few frames may still arrive at the old size.
     if (CVPixelBufferGetWidth(pb) != _width || CVPixelBufferGetHeight(pb) != _height) return;
     int64_t now = host_time_us();
-    int64_t pts = now;
+    int64_t pts = capturePts > 0 ? capturePts : now;
     if (pts <= _lastPtsUs) pts = _lastPtsUs + 1000;
     _lastPtsUs = pts;
     _lastEncodeUs = now;
+    CVPixelBufferRef src = pb, cropped = NULL;
+    if (_lbOn) {
+        cropped = [self cropLetterbox:pb];
+        if (!cropped) return;
+        src = cropped;
+    }
     NSDictionary *opts = nil;
     if (atomic_exchange(&_forceKey, false)) opts = @{(id)kVTEncodeFrameOptionKey_ForceKeyFrame : @YES};
-    VTCompressionSessionEncodeFrame(_vt, pb, CMTimeMake(pts, 1000000), kCMTimeInvalid, (__bridge CFDictionaryRef)opts,
+    VTCompressionSessionEncodeFrame(_vt, src, CMTimeMake(pts, 1000000), kCMTimeInvalid, (__bridge CFDictionaryRef)opts,
                                     NULL, NULL);
+    if (cropped) CVPixelBufferRelease(cropped);
+}
+
+// Crop _lb out of pb (GPU), scaled to the encoder size. Caller releases.
+- (CVPixelBufferRef)cropLetterbox:(CVPixelBufferRef)pb {
+    if (!_xfer) {
+        if (VTPixelTransferSessionCreate(NULL, &_xfer) != noErr) return NULL;
+        VTSessionSetProperty(_xfer, kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_CropSourceToCleanAperture);
+    }
+    CVPixelBufferRef out = NULL;
+    if (!_lbPool || CVPixelBufferPoolCreatePixelBuffer(NULL, _lbPool, &out) != kCVReturnSuccess) return NULL;
+    double W = CVPixelBufferGetWidth(pb), H = CVPixelBufferGetHeight(pb);
+    // Clean aperture offsets are measured from the buffer's centre.
+    NSDictionary *ca = @{
+        (id)kCVImageBufferCleanApertureWidthKey : @(_lb.size.width),
+        (id)kCVImageBufferCleanApertureHeightKey : @(_lb.size.height),
+        (id)kCVImageBufferCleanApertureHorizontalOffsetKey : @(CGRectGetMidX(_lb) - W / 2),
+        (id)kCVImageBufferCleanApertureVerticalOffsetKey : @(CGRectGetMidY(_lb) - H / 2),
+    };
+    CFTypeRef prev = CVBufferCopyAttachment(pb, kCVImageBufferCleanApertureKey, NULL);
+    CVBufferSetAttachment(pb, kCVImageBufferCleanApertureKey, (__bridge CFDictionaryRef)ca, kCVAttachmentMode_ShouldNotPropagate);
+    OSStatus st = VTPixelTransferSessionTransferImage(_xfer, pb, out);
+    if (prev) {
+        CVBufferSetAttachment(pb, kCVImageBufferCleanApertureKey, prev, kCVAttachmentMode_ShouldNotPropagate);
+        CFRelease(prev);
+    } else {
+        CVBufferRemoveAttachment(pb, kCVImageBufferCleanApertureKey);
+    }
+    if (st != noErr) {
+        CVPixelBufferRelease(out);
+        return NULL;
+    }
+    return out;
+}
+
+// Rows/columns of near-black pixels at each edge of the luma plane, sampled
+// along three lines (¼, ½, ¾). Returns NO for an (almost) entirely black frame.
+static BOOL measure_bars(CVPixelBufferRef pb, int *top, int *bottom, int *left, int *right) {
+    if (CVPixelBufferGetPixelFormatType(pb) != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) return NO;
+    if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return NO;
+    const uint8_t *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+    size_t stride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+    int W = (int)CVPixelBufferGetWidthOfPlane(pb, 0), H = (int)CVPixelBufferGetHeightOfPlane(pb, 0);
+    const int black = 24; // video-range black is 16
+    int t = H, b = H, l = W, r = W;
+    for (int k = 1; k <= 3; k++) {
+        int x = W * k / 4, row = H * k / 4;
+        int i = 0;
+        while (i < H / 2 && y[(size_t)i * stride + x] <= black) i++;
+        if (i < t) t = i;
+        i = 0;
+        while (i < H / 2 && y[(size_t)(H - 1 - i) * stride + x] <= black) i++;
+        if (i < b) b = i;
+        i = 0;
+        while (i < W / 2 && y[(size_t)row * stride + i] <= black) i++;
+        if (i < l) l = i;
+        i = 0;
+        while (i < W / 2 && y[(size_t)row * stride + (W - 1 - i)] <= black) i++;
+        if (i < r) r = i;
+    }
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    if (t >= H / 2 || l >= W / 2) return NO; // black frame: no information
+    *top = t; *bottom = b; *left = l; *right = r;
+    return YES;
+}
+
+static void bar_stats(const int *v, int n, int *mn, int *mx) {
+    *mn = INT32_MAX; *mx = 0;
+    for (int i = 0; i < n; i++) {
+        if (v[i] < *mn) *mn = v[i];
+        if (v[i] > *mx) *mx = v[i];
+    }
+}
+
+// Bars on one axis count only if both sides are similar (a centred picture),
+// at least 2% of the frame, and unchanged for the whole 3 s window, so dark
+// scenes or a terminal's black background are not mistaken for bars.
+static int stable_bar(const int *a, const int *b, int n, int extent) {
+    int amn, amx, bmn, bmx;
+    bar_stats(a, n, &amn, &amx);
+    bar_stats(b, n, &bmn, &bmx);
+    int m = amn < bmn ? amn : bmn;
+    if (m < extent / 50) return 0;
+    if (amx - amn > 4 || bmx - bmn > 4) return 0;
+    if (abs(amn - bmn) > (extent / 100 > 4 ? extent / 100 : 4)) return 0;
+    // +2: the first row/column past the bar is often a dark blend of the edge.
+    return (m + 2) & ~1;
+}
+
+// Called on videoQueue for every captured frame; samples 4×/s.
+- (void)checkLetterbox:(CVPixelBufferRef)pb {
+    int64_t now = host_time_us();
+    if (now - _lbLastUs < 250000) return;
+    _lbLastUs = now;
+    int W = (int)CVPixelBufferGetWidth(pb), H = (int)CVPixelBufferGetHeight(pb);
+    int t, b, l, r;
+    if (!measure_bars(pb, &t, &b, &l, &r)) return;
+
+    if (_lbOn) {
+        // Picture now reaches into a cropped bar: undo the crop right away.
+        int ct = (int)_lb.origin.y, cl = (int)_lb.origin.x;
+        int cb = H - (int)CGRectGetMaxY(_lb), cr = W - (int)CGRectGetMaxX(_lb);
+        if (t < ct - 2 || b < cb - 2 || l < cl - 2 || r < cr - 2) {
+            _lbN = _lbPos = 0;
+            [self setLetterbox:CGRectNull];
+        }
+        return;
+    }
+    _lbT[_lbPos] = t; _lbB[_lbPos] = b; _lbL[_lbPos] = l; _lbR[_lbPos] = r;
+    _lbPos = (_lbPos + 1) % 12;
+    if (_lbN < 12) _lbN++;
+    if (_lbN < 12) return;
+    int v = stable_bar(_lbT, _lbB, 12, H);
+    int h = stable_bar(_lbL, _lbR, 12, W);
+    if (!v && !h) return;
+    [self setLetterbox:CGRectMake(h, v, (W - 2 * h) & ~1, (H - 2 * v) & ~1)];
+}
+
+- (void)setLetterbox:(CGRect)crop {
+    BOOL on = !CGRectIsNull(crop);
+    if (!on && !_lbOn) return;
+    if (_vt) {
+        VTCompressionSessionCompleteFrames(_vt, kCMTimeInvalid);
+        VTCompressionSessionInvalidate(_vt);
+        CFRelease(_vt);
+        _vt = NULL;
+    }
+    _lbOn = on;
+    _lb = crop;
+    if (_lbPool) {
+        CVPixelBufferPoolRelease(_lbPool);
+        _lbPool = NULL;
+    }
+    if (on) {
+        fit_size(crop.size.width, crop.size.height, _cfg.max_width, _cfg.max_height, &_encW, &_encH);
+        NSDictionary *attrs = @{
+            (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+            (id)kCVPixelBufferWidthKey : @(_encW),
+            (id)kCVPixelBufferHeightKey : @(_encH),
+            (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+        };
+        CVPixelBufferPoolCreate(NULL, NULL, (__bridge CFDictionaryRef)attrs, &_lbPool);
+    }
+    NSString *e = nil;
+    if (![self setupEncoderWithError:&e]) {
+        _lbOn = NO;
+        [self setupEncoderWithError:&e];
+    }
+    atomic_store(&_forceKey, true);
+    if (getenv("PTP_DEBUG"))
+        fprintf(stderr, "dbg letterbox %s %.0f,%.0f %.0fx%.0f -> %ux%u\n", _lbOn ? "on" : "off", crop.origin.x,
+                crop.origin.y, crop.size.width, crop.size.height, _lbOn ? _encW : _width, _lbOn ? _encH : _height);
 }
 
 - (void)rememberFrame:(CVPixelBufferRef)pb {
@@ -453,6 +635,8 @@ static double backing_scale(CGDirectDisplayID did) {
     }
     _width = w;
     _height = h;
+    _lbOn = NO;
+    _lbN = _lbPos = 0;
     NSString *e = nil;
     if (![self setupEncoderWithError:&e]) {
         // Fall back to the old size rather than stopping the stream.
@@ -516,8 +700,10 @@ static double backing_scale(CGDirectDisplayID did) {
                     cr.size.width, cr.size.height, [a[SCStreamFrameInfoContentScale] doubleValue], scale.doubleValue,
                     _srcW, _srcH);
         }
+        if (CVPixelBufferGetWidth(pb) == _width && CVPixelBufferGetHeight(pb) == _height) [self checkLetterbox:pb];
         [self rememberFrame:pb];
-        [self encode:pb];
+        CMTime cpts = CMSampleBufferGetPresentationTimeStamp(sb);
+        [self encode:pb pts:CMTIME_IS_VALID(cpts) ? (int64_t)(CMTimeGetSeconds(cpts) * 1e6) : 0];
         return;
     }
     int isMic = 0;

@@ -15,6 +15,8 @@ pub struct MediaPacket {
     pub data: Bytes,
     pub duration: Duration,
     pub keyframe: bool,
+    /// Capture time (µs, host clock). Drives video RTP timestamps.
+    pub pts_us: i64,
 }
 
 #[derive(Default)]
