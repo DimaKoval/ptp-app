@@ -250,6 +250,9 @@ int ptp_thumbnail(uint32_t kind, uint32_t sid, uint32_t max_w, uint32_t max_h, u
     double _scaleFactor;
     uint32_t _candW, _candH;
     CGRect _crop, _candCrop;  // window-local points; CGRectNull = whole window
+    double _fullPtsW, _fullPtsH; // window size as ScreenCaptureKit captures it (points, uncropped)
+    CGRect _cropBounds;          // window-server bounds when the crop was set
+    double _cropExtraTop;
     CGRect _defaultSourceRect;
     double _srcW, _srcH; // captured window size in pixels, from frame metadata
     int64_t _candSinceUs, _lastSizeCheckUs;
@@ -395,9 +398,30 @@ static double backing_scale(CGDirectDisplayID did) {
     }
     vis = CGRectIntegral(vis);
     if (vis.size.width < 8 || vis.size.height < 8) return;
-    CGRect crop = CGRectEqualToRect(vis, CGRectIntegral(b))
-                      ? CGRectNull
-                      : CGRectMake(vis.origin.x - b.origin.x, vis.origin.y - b.origin.y, vis.size.width, vis.size.height);
+    b = CGRectIntegral(b);
+
+    // ScreenCaptureKit can capture more than the window server reports: a
+    // fullscreen Chrome window is ~124pt taller than its bounds, with the extra
+    // (its hidden toolbar, rendered black) at the top. Measure that from the
+    // uncropped frames and crop it off together with any off-screen part.
+    double extraTop;
+    if (!CGRectIsNull(_crop)) {
+        if (!CGRectEqualToRect(b, _cropBounds)) {
+            // The window changed while cropped. Frames only show the cropped
+            // area now, so drop the crop and re-measure on the next pass.
+            vis = b;
+            extraTop = -1;
+        } else {
+            extraTop = _cropExtraTop;
+        }
+    } else {
+        if (_fullPtsW < 8 || fabs(_fullPtsW - b.size.width) > 2) return; // frames not caught up yet
+        extraTop = _fullPtsH - b.size.height;
+        if (extraTop < 2) extraTop = 0;
+    }
+    CGRect crop = CGRectNull;
+    if (extraTop > 0 || (extraTop == 0 && !CGRectEqualToRect(vis, b)))
+        crop = CGRectMake(vis.origin.x - b.origin.x, vis.origin.y - b.origin.y + extraTop, vis.size.width, vis.size.height);
 
     uint32_t nw, nh;
     fit_size(vis.size.width * sc, vis.size.height * sc, _cfg.max_width, _cfg.max_height, &nw, &nh);
@@ -414,6 +438,8 @@ static double backing_scale(CGDirectDisplayID did) {
     }
     if (now - _candSinceUs < 300000) return;
     _candW = _candH = 0;
+    _cropBounds = b;
+    _cropExtraTop = extraTop > 0 ? extraTop : 0;
     [self resizeTo:nw height:nh crop:crop];
 }
 
@@ -469,6 +495,11 @@ static double backing_scale(CGDirectDisplayID did) {
             if (crd && CGRectMakeWithDictionaryRepresentation(crd, &cr) && cs > 0 && _scaleFactor > 0) {
                 _srcW = cr.size.width / cs * _scaleFactor;
                 _srcH = cr.size.height / cs * _scaleFactor;
+                CVPixelBufferRef ib = CMSampleBufferGetImageBuffer(sb);
+                if (CGRectIsNull(_crop) && ib && CVPixelBufferGetWidth(ib) == _width && CVPixelBufferGetHeight(ib) == _height) {
+                    _fullPtsW = cr.size.width / cs;
+                    _fullPtsH = cr.size.height / cs;
+                }
             }
         }
         CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
