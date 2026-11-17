@@ -316,7 +316,10 @@ static void fit_size(double srcW, double srcH, uint32_t maxW, uint32_t maxH, uin
     if (VTSessionSetProperty(_vt, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_ConstrainedHigh_AutoLevel) != noErr)
         VTSessionSetProperty(_vt, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel);
     VTSessionSetProperty(_vt, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
-    // Tag the stream as BT.709 (in the H.264 VUI) so decoders don't guess.
+    // Tag the stream as BT.709 (H.264 VUI) so decoders don't guess. Note:
+    // Chrome on macOS shows <video> with the BT.709 "video gamma" whatever
+    // the transfer tag says (midtones lifted: grey 128 → 139), so the viewer
+    // draws frames into a canvas, which honours this tag and is exact.
     VTSessionSetProperty(_vt, kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2);
     VTSessionSetProperty(_vt, kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2);
     VTSessionSetProperty(_vt, kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2);
@@ -721,8 +724,10 @@ static double backing_scale(CGDirectDisplayID did) {
             if (crd && CGRectMakeWithDictionaryRepresentation(crd, &cr) && cs > 0 && _scaleFactor > 0) {
                 _srcW = cr.size.width / cs * _scaleFactor;
                 _srcH = cr.size.height / cs * _scaleFactor;
-                CVPixelBufferRef ib = CMSampleBufferGetImageBuffer(sb);
-                if (CGRectIsNull(_crop) && ib && CVPixelBufferGetWidth(ib) == _width && CVPixelBufferGetHeight(ib) == _height) {
+                // contentRect/contentScale give the captured window size even while
+                // the output is still at an old size, so a new window size and its
+                // crop can be applied in one step instead of two.
+                if (CGRectIsNull(_crop)) {
                     _fullPtsW = cr.size.width / cs;
                     _fullPtsH = cr.size.height / cs;
                 }
@@ -910,6 +915,13 @@ static void vt_output(void *refcon, void *frameRefcon, OSStatus status, VTEncode
                 const uint8_t *ps = NULL;
                 size_t psLen = 0;
                 if (CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, i, &ps, &psLen, NULL, NULL) == noErr) {
+                    static int dumped = 0;
+                    if (i == 0 && !dumped && getenv("PTP_DEBUG")) {
+                        dumped = 1;
+                        fprintf(stderr, "dbg sps ");
+                        for (size_t k = 0; k < psLen; k++) fprintf(stderr, "%02x", ps[k]);
+                        fprintf(stderr, "\n");
+                    }
                     [out appendBytes:startCode length:4];
                     [out appendBytes:ps length:psLen];
                 }
