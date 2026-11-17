@@ -252,7 +252,8 @@ int ptp_thumbnail(uint32_t kind, uint32_t sid, uint32_t max_w, uint32_t max_h, u
     uint32_t _encW, _encH;       // encoder size while _lbOn
     VTPixelTransferSessionRef _xfer;
     CVPixelBufferPoolRef _lbPool;
-    int _lbT[12], _lbB[12], _lbL[12], _lbR[12];
+    int _lbT[8], _lbB[8], _lbL[8], _lbR[8];
+    int _lbSpill;                // consecutive samples with picture past the crop edge
     int _lbN, _lbPos;
     int64_t _lbLastUs;
     // window sources: follow the window's size
@@ -315,6 +316,10 @@ static void fit_size(double srcW, double srcH, uint32_t maxW, uint32_t maxH, uin
     if (VTSessionSetProperty(_vt, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_ConstrainedHigh_AutoLevel) != noErr)
         VTSessionSetProperty(_vt, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel);
     VTSessionSetProperty(_vt, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+    // Tag the stream as BT.709 (in the H.264 VUI) so decoders don't guess.
+    VTSessionSetProperty(_vt, kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2);
+    VTSessionSetProperty(_vt, kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2);
+    VTSessionSetProperty(_vt, kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2);
     VTSessionSetProperty(_vt, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef) @(_cfg.fps));
     VTSessionSetProperty(_vt, kVTCompressionPropertyKey_MaxKeyFrameInterval, (__bridge CFNumberRef) @(_cfg.fps * 3));
     VTSessionSetProperty(_vt, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, (__bridge CFNumberRef) @3);
@@ -433,7 +438,7 @@ static void bar_stats(const int *v, int n, int *mn, int *mx) {
 }
 
 // Bars on one axis count only if both sides are similar (a centred picture),
-// at least 2% of the frame, and unchanged for the whole 3 s window, so dark
+// at least 2% of the frame, and unchanged for the whole 1.6 s window, so dark
 // scenes or a terminal's black background are not mistaken for bars.
 static int stable_bar(const int *a, const int *b, int n, int extent) {
     int amn, amx, bmn, bmx;
@@ -448,30 +453,57 @@ static int stable_bar(const int *a, const int *b, int n, int extent) {
 }
 
 // Called on videoQueue for every captured frame; samples 4×/s.
+// Fraction of 16 points along a line (row y, or column x) that are not black.
+static double line_fill(CVPixelBufferRef pb, BOOL row, int at, int from, int to) {
+    if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return 0;
+    const uint8_t *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+    size_t stride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+    int lit = 0;
+    for (int k = 0; k < 16; k++) {
+        int p = from + (to - from) * (2 * k + 1) / 32;
+        uint8_t v = row ? y[(size_t)at * stride + p] : y[(size_t)p * stride + at];
+        if (v > 24) lit++;
+    }
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    return lit / 16.0;
+}
+
+// Called on videoQueue for every captured frame; samples 5×/s. Bars must be
+// stable for 1.6 s before cropping.
 - (void)checkLetterbox:(CVPixelBufferRef)pb {
     int64_t now = host_time_us();
-    if (now - _lbLastUs < 250000) return;
+    if (now - _lbLastUs < 200000) return;
     _lbLastUs = now;
     int W = (int)CVPixelBufferGetWidth(pb), H = (int)CVPixelBufferGetHeight(pb);
-    int t, b, l, r;
-    if (!measure_bars(pb, &t, &b, &l, &r)) return;
 
     if (_lbOn) {
-        // Picture now reaches into a cropped bar: undo the crop right away.
-        int ct = (int)_lb.origin.y, cl = (int)_lb.origin.x;
-        int cb = H - (int)CGRectGetMaxY(_lb), cr = W - (int)CGRectGetMaxX(_lb);
-        if (t < ct - 2 || b < cb - 2 || l < cl - 2 || r < cr - 2) {
+        // Undo only when the picture itself grows into a bar: check a line just
+        // outside each cropped edge, across the whole width/height. Player
+        // controls or subtitles drawn further out in the bar don't count, so
+        // moving the mouse over a fullscreen video doesn't make the crop flap.
+        int x0 = (int)_lb.origin.x, y0 = (int)_lb.origin.y;
+        int x1 = (int)CGRectGetMaxX(_lb), y1 = (int)CGRectGetMaxY(_lb);
+        BOOL spill = NO;
+        if (y0 >= 8)
+            spill |= line_fill(pb, YES, y0 - 6, x0, x1) >= 0.5 || line_fill(pb, YES, y1 + 5, x0, x1) >= 0.5;
+        if (x0 >= 8)
+            spill |= line_fill(pb, NO, x0 - 6, y0, y1) >= 0.5 || line_fill(pb, NO, x1 + 5, y0, y1) >= 0.5;
+        _lbSpill = spill ? _lbSpill + 1 : 0;
+        if (_lbSpill >= 2) {
             _lbN = _lbPos = 0;
+            _lbSpill = 0;
             [self setLetterbox:CGRectNull];
         }
         return;
     }
+    int t, b, l, r;
+    if (!measure_bars(pb, &t, &b, &l, &r)) return;
     _lbT[_lbPos] = t; _lbB[_lbPos] = b; _lbL[_lbPos] = l; _lbR[_lbPos] = r;
-    _lbPos = (_lbPos + 1) % 12;
-    if (_lbN < 12) _lbN++;
-    if (_lbN < 12) return;
-    int v = stable_bar(_lbT, _lbB, 12, H);
-    int h = stable_bar(_lbL, _lbR, 12, W);
+    _lbPos = (_lbPos + 1) % 8;
+    if (_lbN < 8) _lbN++;
+    if (_lbN < 8) return;
+    int v = stable_bar(_lbT, _lbB, 8, H);
+    int h = stable_bar(_lbL, _lbR, 8, W);
     if (!v && !h) return;
     [self setLetterbox:CGRectMake(h, v, (W - 2 * h) & ~1, (H - 2 * v) & ~1)];
 }
@@ -487,6 +519,7 @@ static int stable_bar(const int *a, const int *b, int n, int extent) {
     }
     _lbOn = on;
     _lb = crop;
+    _lbSpill = 0;
     if (_lbPool) {
         CVPixelBufferPoolRelease(_lbPool);
         _lbPool = NULL;
@@ -1030,6 +1063,10 @@ void *ptp_start(const ptp_config *cfg, uint32_t *out_width, uint32_t *out_height
         vc.minimumFrameInterval = CMTimeMake(1, (int32_t)fps);
         vc.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
         vc.colorMatrix = kCGDisplayStreamYCbCrMatrix_ITU_R_709_2;
+        // Convert from the display's colour space (Display P3 on Macs with wide-
+        // gamut screens) to sRGB/BT.709, which is what browsers assume. Without
+        // this P3 values are shown as sRGB: washed out, warm colours look cold.
+        vc.colorSpaceName = kCGColorSpaceSRGB;
         vc.queueDepth = 6;
         vc.showsCursor = YES;
         vc.capturesAudio = NO;
