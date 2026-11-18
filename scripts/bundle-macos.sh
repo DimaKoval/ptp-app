@@ -5,12 +5,26 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$PATH"
 
-cargo build --release
+# PTP_UNIVERSAL=1 builds one binary for Apple Silicon + Intel Macs.
+VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+if [ "${PTP_UNIVERSAL:-0}" = "1" ]; then
+  rustup target add aarch64-apple-darwin x86_64-apple-darwin >/dev/null
+  cargo build --release --target aarch64-apple-darwin
+  cargo build --release --target x86_64-apple-darwin
+  OUT="target/universal"
+  mkdir -p "$OUT"
+  lipo -create -output "$OUT/ptp-share" \
+    target/aarch64-apple-darwin/release/ptp-share \
+    target/x86_64-apple-darwin/release/ptp-share
+else
+  cargo build --release
+  OUT="target/release"
+fi
 
-APP="target/release/ptp-share.app"
+APP="$OUT/ptp-share.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp target/release/ptp-share "$APP/Contents/MacOS/ptp-share"
+cp "$OUT/ptp-share" "$APP/Contents/MacOS/ptp-share"
 cp assets/icon.icns "$APP/Contents/Resources/ptp-share.icns"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
@@ -24,7 +38,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleExecutable</key><string>ptp-share</string>
   <key>CFBundleIconFile</key><string>ptp-share</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>

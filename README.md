@@ -42,6 +42,30 @@ If macOS keeps refusing access, reset the permission and grant it again:
 tccutil reset ScreenCapture dev.ptpshare.host
 ```
 
+## Sharing the Mac app with friends
+
+```bash
+./scripts/package-macos.sh
+```
+
+Builds `dist/ptp-share-<version>-mac.zip`: one app for Apple Silicon and Intel
+Macs (macOS 13+), signed with your Apple Development certificate (the free one
+Xcode creates). A stable signature means friends grant Screen Recording once
+and it survives updates.
+
+It is not notarized (that needs the paid Apple Developer Program), so your
+friend does this once per version:
+
+1. Unzip and drag `ptp-share.app` into Applications.
+2. Open it; macOS says it can't verify the app. Click **Done**.
+3. System Settings › Privacy & Security › scroll down › **Open Anyway** next to
+   the ptp-share message (on macOS 15+, right-click › Open no longer works).
+4. Start sharing, allow **Screen Recording**, then quit and reopen the app.
+
+Or, instead of steps 2–3: `xattr -dr com.apple.quarantine /Applications/ptp-share.app`
+
+Bump `version` in `Cargo.toml` before packaging a new release.
+
 ## Windows (10 2004+ / 11)
 
 Download `ptp-share.exe` from the latest
