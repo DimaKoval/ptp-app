@@ -202,7 +202,7 @@ pub fn run(rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("PTP Share")
-            .with_inner_size([1120.0, 760.0])
+            .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([900.0, 620.0])
             .with_icon(
                 eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png")).unwrap_or_default(),
