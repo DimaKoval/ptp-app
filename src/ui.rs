@@ -72,7 +72,14 @@ fn setup_style(ctx: &egui::Context) {
     v.widgets.active.bg_fill = ACCENT_SOFT;
     v.widgets.active.weak_bg_fill = ACCENT_SOFT;
     v.window_corner_radius = CornerRadius::same(12);
-    ctx.set_global_style(style);
+    // Always dark, whatever the OS theme: egui keeps a separate style per
+    // theme and follows the system one, which on a light Windows gave light
+    // text-field interiors and a black title on the dark background.
+    ctx.set_theme(egui::Theme::Dark);
+    // Dark window title bar too (Windows draws it in the OS theme otherwise).
+    ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
+    ctx.set_style_of(egui::Theme::Dark, style.clone());
+    ctx.set_style_of(egui::Theme::Light, style);
 }
 
 fn card() -> egui::Frame {
@@ -146,7 +153,8 @@ fn primary_button(ui: &mut egui::Ui, text: String, color: Color32, enabled: bool
         .stroke(Stroke::NONE)
         .corner_radius(10)
         .min_size(Vec2::new(ui.available_width(), 44.0));
-    ui.add_enabled(enabled, btn)
+    // Button content follows the parent layout's alignment; force centered.
+    ui.with_layout(ui.layout().with_cross_align(Align::Center), |ui| ui.add_enabled(enabled, btn)).inner
 }
 
 fn badge(ui: &mut egui::Ui, text: &str, color: Color32) {
@@ -363,6 +371,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
+        debug_screenshot(&ctx);
         if self.session.is_some() || self.start_rx.is_some() {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
@@ -389,6 +398,37 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG).inner_margin(Margin::same(20)))
             .show(ui, |ui| self.source_picker(ui));
+    }
+}
+
+/// Debug hook: PTP_UI_SHOT=<file.ppm> saves a screenshot of the window after
+/// ~2 s and quits. PTP_UI_THEME=light switches egui to its light theme first,
+/// as a light OS theme would (the UI must still look the same).
+fn debug_screenshot(ctx: &egui::Context) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static FRAME: AtomicU32 = AtomicU32::new(0);
+    let Ok(path) = std::env::var("PTP_UI_SHOT") else { return };
+    let n = FRAME.fetch_add(1, Ordering::Relaxed);
+    if n == 1 && std::env::var("PTP_UI_THEME").as_deref() == Ok("light") {
+        ctx.set_theme(egui::Theme::Light);
+    }
+    ctx.request_repaint_after(Duration::from_millis(50));
+    if n == 40 {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+    }
+    let shot = ctx.input(|i| {
+        i.raw.events.iter().find_map(|e| match e {
+            egui::Event::Screenshot { image, .. } => Some(image.clone()),
+            _ => None,
+        })
+    });
+    if let Some(img) = shot {
+        let mut out = format!("P6\n{} {}\n255\n", img.size[0], img.size[1]).into_bytes();
+        for p in &img.pixels {
+            out.extend_from_slice(&[p.r(), p.g(), p.b()]);
+        }
+        let _ = std::fs::write(&path, out);
+        std::process::exit(0);
     }
 }
 

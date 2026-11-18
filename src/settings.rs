@@ -8,16 +8,18 @@ pub enum Resolution {
     P720,
     P1080,
     P1440,
+    P2160,
 }
 
 impl Resolution {
-    pub const ALL: [Resolution; 3] = [Resolution::P720, Resolution::P1080, Resolution::P1440];
+    pub const ALL: [Resolution; 4] = [Resolution::P720, Resolution::P1080, Resolution::P1440, Resolution::P2160];
 
     pub fn label(self) -> &'static str {
         match self {
             Resolution::P720 => "720p",
             Resolution::P1080 => "1080p",
             Resolution::P1440 => "1440p",
+            Resolution::P2160 => "4K",
         }
     }
 
@@ -27,6 +29,7 @@ impl Resolution {
             Resolution::P720 => (1280, 720),
             Resolution::P1080 => (1920, 1080),
             Resolution::P1440 => (2560, 1440),
+            Resolution::P2160 => (3840, 2160),
         }
     }
 
@@ -36,6 +39,7 @@ impl Resolution {
             Resolution::P720 => 4.0,
             Resolution::P1080 => 8.0,
             Resolution::P1440 => 14.0,
+            Resolution::P2160 => 25.0,
         };
         base * match fps {
             0..=30 => 0.7,
@@ -84,9 +88,9 @@ pub const DISCORD: &str = "discord.exe";
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            resolution: Resolution::P1080,
+            resolution: Resolution::P1440,
             fps: 60,
-            bitrate_mbps: Resolution::P1080.suggested_mbps(60),
+            bitrate_mbps: Resolution::P1440.suggested_mbps(60),
             audio_mode: AudioMode::System,
             excluded_apps: vec![DISCORD.into()],
             audio_app: None,
