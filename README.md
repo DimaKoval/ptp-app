@@ -89,17 +89,25 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 ## Settings
 
-- **Resolution:** 720p, 1080p or 1440p. The picture is scaled to fit and
-  never upscaled.
+- **Resolution:** 720p, 1080p, 1440p (default) or 4K. The picture is scaled
+  to fit and never upscaled.
 - **Frame rate:** 30, 60 or 120 fps.
-- **Bitrate:** adjustable while live. Your upload needs about bitrate ×
-  viewers.
+- **Bitrate:** your upload needs about bitrate × viewers.
 - **Audio:** off, system audio minus excluded apps (Discord is excluded by
   default), or a single app. The microphone is used only if you turn on
   "Include my microphone" (macOS 15+).
 - **Network:** viewer page URL (default:
   `https://dimakoval.github.io/ptp-web/`), an optional TURN server, and the
   signaling relays.
+
+**Changing things while live:** resolution, frame rate, bitrate, audio and
+the shared screen or window (the **Change** button) all apply immediately.
+The app starts the new capture next to the running one and switches over, so
+viewers stay connected and see no gap. Network settings apply next time.
+
+**Your link** stays the same every time you go live, so friends can bookmark
+it; a viewer page left open reconnects by itself when you go live again. The
+refresh button next to the link makes a new one (the old link stops working).
 
 Settings are saved to `~/Library/Application Support/ptp-share/settings.json`.
 

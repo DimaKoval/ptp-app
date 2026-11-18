@@ -54,12 +54,38 @@ fn main() -> anyhow::Result<()> {
         } else {
             SourceSelection { kind: SourceKind::TestPattern, id: 0, label: "Test pattern".into() }
         };
-        let session = HostSession::start(source, &settings, rt.handle().clone())?;
-        println!("Streaming {}x{}@{}", session.width, session.height, session.fps);
+        // Test hooks: PTP_ROOM=<saved secret> reuses a link; PTP_TEST_STOP_AFTER=<secs>
+        // ends the session properly (viewers get "ended") and exits.
+        let room = std::env::var("PTP_ROOM").ok().and_then(|r| signaling::Room::from_saved(&r)).unwrap_or_else(signaling::Room::generate);
+        let stop_after = std::env::var("PTP_TEST_STOP_AFTER").ok().and_then(|v| v.parse::<u64>().ok());
+        let session = HostSession::start(source, &settings, room, rt.handle().clone())?;
+        let i = session.info();
+        println!("Streaming {}x{}@{}", i.width, i.height, i.fps);
+        // Test hook: PTP_TEST_RECONFIG=<secs> switches to 720p @ 30 fps while live.
+        if let Some(secs) = std::env::var("PTP_TEST_RECONFIG").ok().and_then(|v| v.parse::<u64>().ok()) {
+            let control = session.control();
+            let mut s2 = settings.clone();
+            s2.resolution = settings::Resolution::P720;
+            s2.fps = 30;
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+                let t = std::time::Instant::now();
+                match control.reconfigure(None, &s2) {
+                    Ok(()) => println!("reconfigured to 720p30 in {} ms", t.elapsed().as_millis()),
+                    Err(e) => println!("reconfigure failed: {e}"),
+                }
+            });
+        }
         println!("LINK {}", session.link);
         let mut last = (0u64, 0u64, 0u64);
+        let t0 = std::time::Instant::now();
         loop {
             std::thread::sleep(std::time::Duration::from_secs(5));
+            if stop_after.is_some_and(|s| t0.elapsed().as_secs() >= s) {
+                println!("stopping");
+                session.stop();
+                return Ok(());
+            }
             let relays = session.relay_status();
             let up = relays.iter().filter(|r| r.connected).count();
             let viewers = session.viewers();
@@ -68,7 +94,8 @@ fn main() -> anyhow::Result<()> {
             let ap = st.audio_packets.load(std::sync::atomic::Ordering::Relaxed);
             let vf = st.video_frames.load(std::sync::atomic::Ordering::Relaxed);
             println!(
-                "video {} fps{} | relays {}/{} | audio {} kbps, {} pkt/s, pcm dropped {} | viewers: {}",
+                "{} | video {} fps{} | relays {}/{} | audio {} kbps, {} pkt/s, pcm dropped {} | viewers: {}",
+                { let i = session.info(); format!("{}x{}@{}", i.width, i.height, i.fps) },
                 (vf - last.2) / 5,
                 session.error().map(|e| format!(" [{e}]")).unwrap_or_default(),
                 up,

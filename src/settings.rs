@@ -77,6 +77,9 @@ pub struct Settings {
     pub turn_url: String,
     pub turn_username: String,
     pub turn_credential: String,
+    /// Secret behind the share link (base64url). Kept so the link stays the
+    /// same between sessions until the user makes a new one.
+    pub room_secret: String,
 }
 
 /// App id of Discord: a bundle id on macOS, the executable name on Windows.
@@ -100,6 +103,7 @@ impl Default for Settings {
             turn_url: String::new(),
             turn_username: String::new(),
             turn_credential: String::new(),
+            room_secret: String::new(),
         }
     }
 }

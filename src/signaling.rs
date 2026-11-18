@@ -47,6 +47,17 @@ impl Room {
         Room::from_secret(rand::random())
     }
 
+    /// Room from a saved secret (base64url), if it's valid.
+    pub fn from_saved(s: &str) -> Option<Room> {
+        let b = URL_SAFE_NO_PAD.decode(s.trim()).ok()?;
+        Some(Room::from_secret(b.try_into().ok()?))
+    }
+
+    /// The secret in the form `from_saved` takes.
+    pub fn saved(&self) -> String {
+        URL_SAFE_NO_PAD.encode(self.secret)
+    }
+
     pub fn from_secret(secret: [u8; 32]) -> Room {
         let topic = hex(&sha256_parts(&[b"ptp-share/topic/v1", &secret]));
         let key = sha256_parts(&[b"ptp-share/key/v1", &secret]);
@@ -144,6 +155,8 @@ pub enum SignalMessage {
     Bye { sid: String },
     /// host → viewer: stream is over
     Ended,
+    /// host → viewer: the stream's size or frame rate changed
+    Info { width: u32, height: u32, fps: u32 },
 }
 
 /// A decrypted message plus who sent it.

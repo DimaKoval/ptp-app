@@ -2,6 +2,7 @@
 
 use crate::capture::{self, SourceKind, SourceList, Thumbnail};
 use crate::session::{HostSession, SourceSelection, ViewerState};
+use crate::signaling::Room;
 use crate::settings::{AudioMode, FPS_OPTIONS, Resolution, Settings};
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontId, Layout, Margin, RichText, Sense, Stroke, StrokeKind, TextureHandle, Vec2,
@@ -171,6 +172,30 @@ fn badge(ui: &mut egui::Ui, text: &str, color: Color32) {
 
 type ThumbKey = (SourceKind, u32);
 
+/// The settings that need a capture restart when changed while live.
+#[derive(Clone, PartialEq)]
+struct CaptureKey {
+    resolution: Resolution,
+    fps: u32,
+    audio_mode: AudioMode,
+    excluded_apps: Vec<String>,
+    audio_app: Option<String>,
+    capture_mic: bool,
+}
+
+impl CaptureKey {
+    fn of(s: &Settings) -> CaptureKey {
+        CaptureKey {
+            resolution: s.resolution,
+            fps: s.fps,
+            audio_mode: s.audio_mode,
+            excluded_apps: s.excluded_apps.clone(),
+            audio_app: s.audio_app.clone(),
+            capture_mic: s.capture_mic,
+        }
+    }
+}
+
 enum StartResult {
     Ok(HostSession),
     Err(String),
@@ -192,7 +217,14 @@ struct App {
     copied_at: Option<Instant>,
     rate_sample: (Instant, u64, u64, u64),
     rate: (f32, f32),
-    live_bitrate: f32,
+    /// Live changes: capture settings last applied, and a running reconfigure.
+    applied: Option<CaptureKey>,
+    applied_bitrate: f32,
+    reconfig_rx: Option<Receiver<Result<(), String>>>,
+    /// Source the live session is showing, and one picked but not applied yet.
+    live_source: Option<(SourceKind, u32, String)>,
+    pending_source: Option<(SourceKind, u32, String)>,
+    picking_source: bool,
     show_network: bool,
     relays_text: String,
     window_filter: String,
@@ -227,7 +259,12 @@ impl App {
         let relays_text = settings.relays.join("\n");
         let mut app = App {
             rt,
-            live_bitrate: settings.bitrate_mbps,
+            applied: None,
+            applied_bitrate: settings.bitrate_mbps,
+            reconfig_rx: None,
+            live_source: None,
+            pending_source: None,
+            picking_source: false,
             settings,
             sources: SourceList::default(),
             sources_rx: None,
@@ -315,7 +352,9 @@ impl App {
                 self.start_rx = None;
                 match res {
                     StartResult::Ok(s) => {
-                        self.live_bitrate = self.settings.bitrate_mbps;
+                        self.applied = Some(CaptureKey::of(&self.settings));
+                        self.applied_bitrate = self.settings.bitrate_mbps;
+                        self.live_source = self.selected.clone();
                         self.rate_sample = (Instant::now(), 0, 0, 0);
                         self.session = Some(s);
                     }
@@ -345,6 +384,7 @@ impl App {
             self.settings.relays = crate::signaling::DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect();
             self.relays_text = self.settings.relays.join("\n");
         }
+        let room = self.room();
         self.settings.save();
         self.error = None;
         let settings = self.settings.clone();
@@ -352,11 +392,82 @@ impl App {
         let (tx, rx) = channel();
         self.start_rx = Some(rx);
         std::thread::spawn(move || {
-            let res = match HostSession::start(SourceSelection { kind, id, label }, &settings, handle) {
+            let res = match HostSession::start(SourceSelection { kind, id, label }, &settings, room, handle) {
                 Ok(s) => StartResult::Ok(s),
                 Err(e) => StartResult::Err(e.to_string()),
             };
             let _ = tx.send(res);
+        });
+    }
+
+    /// The saved room (same link every session); makes one the first time.
+    fn room(&mut self) -> Room {
+        if let Some(r) = Room::from_saved(&self.settings.room_secret) {
+            return r;
+        }
+        let r = Room::generate();
+        self.settings.room_secret = r.saved();
+        self.settings.save();
+        r
+    }
+
+    fn current_link(&mut self) -> String {
+        let relays: Vec<String> = self.relays_text.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        let relays = if relays.is_empty() {
+            crate::signaling::DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect()
+        } else {
+            relays
+        };
+        let url = self.settings.viewer_url.trim().to_string();
+        self.room().link(&url, &relays)
+    }
+
+    /// While live: push changed settings to the running session. Capture
+    /// changes restart capture next to the running one (viewers stay
+    /// connected); bitrate is applied in place once the slider is released.
+    fn apply_live_changes(&mut self, ctx: &egui::Context) {
+        let Some(session) = &self.session else { return };
+        if let Some(rx) = &self.reconfig_rx {
+            match rx.try_recv() {
+                Ok(res) => {
+                    self.reconfig_rx = None;
+                    if let Err(e) = res {
+                        self.error = Some(e);
+                    }
+                }
+                Err(_) => {
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                    return;
+                }
+            }
+        }
+        let dragging = ctx.input(|i| i.pointer.any_down());
+        if !dragging && (self.settings.bitrate_mbps - self.applied_bitrate).abs() > 0.01 {
+            self.applied_bitrate = self.settings.bitrate_mbps;
+            session.set_bitrate((self.settings.bitrate_mbps * 1000.0) as u32);
+            self.settings.save();
+        }
+        let key = CaptureKey::of(&self.settings);
+        let source = self.pending_source.take();
+        if self.applied.as_ref() == Some(&key) && source.is_none() {
+            return;
+        }
+        self.applied = Some(key);
+        self.error = None;
+        self.settings.save();
+        if let Some(s) = &source {
+            self.live_source = Some(s.clone());
+            self.selected = Some(s.clone());
+        }
+        let control = session.control();
+        let settings = self.settings.clone();
+        let (tx, rx) = channel();
+        self.reconfig_rx = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let src = source.map(|(kind, id, label)| SourceSelection { kind, id, label });
+            let _ = tx.send(control.reconfigure(src, &settings).map_err(|e| e.to_string()));
+            ctx.request_repaint();
         });
     }
 
@@ -372,6 +483,20 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
         debug_screenshot(&ctx);
+        // Debug: PTP_UI_AUTOSTART=1 starts sharing the first screen (with
+        // PTP_UI_SHOT, to screenshot the live view); =pick also opens the
+        // source switcher.
+        if let Ok(mode) = std::env::var("PTP_UI_AUTOSTART") {
+            static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !self.sources.displays.is_empty() && !STARTED.swap(true, Ordering::Relaxed) {
+                let d = &self.sources.displays[0];
+                self.selected = Some((SourceKind::Display, d.id, d.name.clone()));
+                self.start();
+            }
+            if mode == "pick" && self.session.is_some() && !self.picking_source && self.live_source == self.selected {
+                self.picking_source = true;
+            }
+        }
         if self.session.is_some() || self.start_rx.is_some() {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
@@ -382,9 +507,17 @@ impl eframe::App for App {
             .show(ui, |ui| self.top_bar(ui));
 
         if self.session.is_some() {
+            egui::Panel::right("settings")
+                .exact_size(360.0)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::same(20)))
+                .show(ui, |ui| self.settings_panel(ui));
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(BG).inner_margin(Margin::same(20)))
                 .show(ui, |ui| self.live_view(ui));
+            self.source_modal(&ctx);
+            self.apply_live_changes(&ctx);
             return;
         }
 
@@ -413,7 +546,7 @@ fn debug_screenshot(ctx: &egui::Context) {
         ctx.set_theme(egui::Theme::Light);
     }
     ctx.request_repaint_after(Duration::from_millis(50));
-    if n == 40 {
+    if n == std::env::var("PTP_UI_SHOT_FRAME").ok().and_then(|v| v.parse().ok()).unwrap_or(40) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
     }
     let shot = ctx.input(|i| {
@@ -664,7 +797,7 @@ impl App {
 
     fn settings_panel(&mut self, ui: &mut egui::Ui) {
         let starting = self.start_rx.is_some();
-        egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(ui.available_height() - 130.0).show(ui, |ui| {
+        egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(ui.available_height() - if self.session.is_some() { 70.0 } else { 200.0 }).show(ui, |ui| {
             ui.label(RichText::new("Stream settings").size(18.0).strong());
             ui.add_space(8.0);
 
@@ -802,7 +935,11 @@ impl App {
             if ui.add(egui::Button::new(RichText::new(header).color(MUTED).strong().size(13.0)).frame(false)).clicked() {
                 self.show_network = !self.show_network;
             }
+            if self.show_network && self.session.is_some() {
+                ui.label(RichText::new("Network settings apply the next time you go live.").size(12.0).color(MUTED));
+            }
             if self.show_network {
+                ui.add_enabled_ui(self.session.is_none(), |ui| {
                 ui.label(RichText::new("Viewer page URL (your GitHub Pages site)").size(12.0).color(MUTED));
                 ui.add(egui::TextEdit::singleline(&mut self.settings.viewer_url).desired_width(f32::INFINITY));
                 ui.add_space(4.0);
@@ -825,9 +962,23 @@ impl App {
                 ui.add_space(4.0);
                 ui.label(RichText::new("Signaling relays (Nostr, one per line)").size(12.0).color(MUTED));
                 ui.add(egui::TextEdit::multiline(&mut self.relays_text).desired_rows(4).desired_width(f32::INFINITY));
+                });
             }
         });
 
+        if self.session.is_some() {
+            ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                ui.horizontal(|ui| {
+                    if self.reconfig_rx.is_some() {
+                        ui.spinner();
+                        ui.label(RichText::new("Applying…").size(12.0).color(MUTED));
+                    } else {
+                        ui.label(RichText::new(format!("{}  Changes apply live — viewers stay connected.", icon::LIGHTNING)).size(12.0).color(MUTED));
+                    }
+                });
+            });
+            return;
+        }
         ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
             let can_start = self.selected.is_some() && !starting;
             let label = if starting {
@@ -841,6 +992,15 @@ impl App {
             if let Some((_, _, label)) = &self.selected {
                 ui.label(RichText::new(format!("Sharing: {label}")).size(12.0).color(MUTED));
             }
+            ui.add_space(4.0);
+            let link = self.current_link();
+            let mut new_link = false;
+            link_box(ui, &link, &mut self.copied_at, Some(&mut new_link));
+            if new_link {
+                self.settings.room_secret = Room::generate().saved();
+                self.settings.save();
+            }
+            section_title(ui, icon::LINK, "YOUR LINK — STAYS THE SAME EVERY TIME");
             if let Some(e) = self.error.clone() {
                 egui::Frame::new()
                     .fill(RED.gamma_multiply(0.15))
@@ -869,7 +1029,7 @@ impl App {
         let relays_up = relays.iter().filter(|r| r.connected).count();
         let mut stop = false;
         let mut kick: Option<String> = None;
-        let mut new_bitrate: Option<f32> = None;
+        let mut pick_source = false;
 
         ui.vertical_centered(|ui| {
             ui.set_max_width(760.0);
@@ -890,42 +1050,25 @@ impl App {
                         );
                     });
                 });
-                ui.label(
-                    RichText::new(format!(
-                        "{}  ·  {}×{} @ {} fps",
-                        session.source_label, session.width, session.height, session.fps
-                    ))
-                    .color(MUTED),
-                );
+                let info = session.info();
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{}  ·  {}×{} @ {} fps", info.source_label, info.width, info.height, info.fps))
+                            .color(MUTED),
+                    );
+                    if ui
+                        .add_enabled(self.reconfig_rx.is_none(), egui::Button::new(format!("{}  Change", icon::SWAP)).small())
+                        .clicked()
+                    {
+                        pick_source = true;
+                    }
+                });
                 ui.add_space(12.0);
 
                 section_title(ui, icon::LINK, "ROOM LINK — SEND THIS TO YOUR FRIENDS");
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(16, 18, 24))
-                    .stroke(Stroke::new(1.0, BORDER))
-                    .corner_radius(10)
-                    .inner_margin(Margin::same(10))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let copied = self.copied_at.map(|t| t.elapsed() < Duration::from_secs(2)).unwrap_or(false);
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let txt = if copied { format!("{}  Copied", icon::CHECK) } else { format!("{}  Copy", icon::COPY) };
-                                let btn = egui::Button::new(RichText::new(txt).color(Color32::WHITE).strong())
-                                    .fill(if copied { GREEN.gamma_multiply(0.8) } else { ACCENT })
-                                    .corner_radius(8);
-                                if ui.add(btn).clicked() {
-                                    ui.ctx().copy_text(link.clone());
-                                    self.copied_at = Some(Instant::now());
-                                }
-                                ui.add(
-                                    egui::Label::new(RichText::new(&link).monospace().size(12.5).color(TEXT)).truncate(),
-                                )
-                                .on_hover_text(&link);
-                            });
-                        });
-                    });
+                link_box(ui, &link, &mut self.copied_at, None);
                 ui.label(
-                    RichText::new("Anyone with this link can watch. A new link is generated every time you start.")
+                    RichText::new("Anyone with this link can watch. It stays the same next time you go live.")
                         .size(12.0)
                         .color(MUTED),
                 );
@@ -967,12 +1110,6 @@ impl App {
 
             card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                section_title(ui, icon::SLIDERS_HORIZONTAL, "LIVE BITRATE");
-                let r = ui.add(egui::Slider::new(&mut self.live_bitrate, 1.0..=50.0).step_by(0.5).suffix(" Mbps"));
-                if r.drag_stopped() || (r.changed() && !r.dragged()) {
-                    new_bitrate = Some(self.live_bitrate);
-                }
-                ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(format!("Signaling relays {relays_up}/{}", relays.len())).size(12.0).color(MUTED));
                     for r in &relays {
@@ -995,14 +1132,86 @@ impl App {
         if let Some(sid) = kick {
             session.kick(&sid);
         }
-        if let Some(b) = new_bitrate {
-            session.set_bitrate((b * 1000.0) as u32);
-            self.settings.bitrate_mbps = b;
+        if pick_source {
+            self.picking_source = true;
+            self.refresh_sources(ui.ctx());
         }
         if stop {
             self.stop();
         }
     }
+}
+
+impl App {
+    /// While live: pick a different screen or window; switching keeps viewers.
+    fn source_modal(&mut self, ctx: &egui::Context) {
+        if !self.picking_source {
+            return;
+        }
+        let before = self.selected.clone();
+        let screen = ctx.content_rect();
+        let resp = egui::Modal::new(egui::Id::new("pick_source"))
+            .frame(egui::Frame::new().fill(BG).corner_radius(14).inner_margin(Margin::same(20)).stroke(Stroke::new(1.0, BORDER)))
+            .show(ctx, |ui| {
+                ui.set_width((screen.width() - 120.0).min(800.0));
+                ui.set_height((screen.height() - 160.0).min(640.0));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Switch to another screen or window — viewers stay connected.").color(MUTED));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button(format!("{}  Cancel", icon::X)).clicked() {
+                            self.picking_source = false;
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+                self.source_picker(ui);
+            });
+        if resp.should_close() {
+            self.picking_source = false;
+        }
+        if self.selected != before {
+            self.picking_source = false;
+            if self.selected != self.live_source {
+                self.pending_source = self.selected.clone();
+            }
+        }
+    }
+}
+
+/// The share link with a Copy button (and optionally "New link").
+fn link_box(ui: &mut egui::Ui, link: &str, copied_at: &mut Option<Instant>, new_link: Option<&mut bool>) {
+    egui::Frame::new()
+        .fill(Color32::from_rgb(16, 18, 24))
+        .stroke(Stroke::new(1.0, BORDER))
+        .corner_radius(10)
+        .inner_margin(Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let copied = copied_at.map(|t| t.elapsed() < Duration::from_secs(2)).unwrap_or(false);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if let Some(flag) = new_link {
+                        if ui
+                            .button(icon::ARROWS_CLOCKWISE)
+                            .on_hover_text("Make a new link. The old one stops working.")
+                            .clicked()
+                        {
+                            *flag = true;
+                        }
+                    }
+                    let txt = if copied { format!("{}  Copied", icon::CHECK) } else { format!("{}  Copy", icon::COPY) };
+                    let btn = egui::Button::new(RichText::new(txt).color(Color32::WHITE).strong())
+                        .fill(if copied { GREEN.gamma_multiply(0.8) } else { ACCENT })
+                        .corner_radius(8);
+                    if ui.add(btn).clicked() {
+                        ui.ctx().copy_text(link.to_string());
+                        *copied_at = Some(Instant::now());
+                    }
+                    ui.add(egui::Label::new(RichText::new(link).monospace().size(12.5).color(TEXT)).truncate())
+                        .on_hover_text(link);
+                });
+            });
+        });
 }
 
 #[allow(non_upper_case_globals)]

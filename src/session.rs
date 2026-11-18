@@ -21,7 +21,7 @@ use rtc::rtp_transceiver::rtp_sender::{
     RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind,
 };
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -52,10 +52,20 @@ pub struct ViewerInfo {
     pub since: Instant,
 }
 
+#[derive(Debug, Clone)]
 pub struct SourceSelection {
     pub kind: SourceKind,
     pub id: u32,
     pub label: String,
+}
+
+/// What the viewer is currently getting, for display.
+#[derive(Debug, Clone)]
+pub struct VideoInfo {
+    pub source_label: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
 }
 
 struct PeerHandle {
@@ -65,18 +75,26 @@ struct PeerHandle {
     offer: Arc<Mutex<Option<SignalMessage>>>,
 }
 
+type MakeCallbacks = Arc<dyn Fn(u64, u32) -> Callbacks + Send + Sync>;
+
 struct Shared {
     capture: Mutex<Option<Capture>>,
+    /// Generation of the capture whose output is forwarded; output of any
+    /// other (old or still-starting) capture is dropped.
+    capture_gen: Arc<AtomicU64>,
+    /// Config of the running capture; restarts reuse it.
+    capture_cfg: Mutex<CaptureConfig>,
+    /// Serializes capture swaps (live settings changes vs. the watchdog).
+    swap_lock: Mutex<()>,
+    make_callbacks: MakeCallbacks,
+    has_system_audio: Arc<AtomicBool>,
     media_tx: broadcast::Sender<MediaPacket>,
     signaling: Arc<Signaling>,
     viewers: Mutex<BTreeMap<String, ViewerInfo>>,
     peers: Mutex<HashMap<String, PeerHandle>>,
     shutdown: watch::Receiver<bool>,
     ice_servers: Vec<IceServer>,
-    has_audio: bool,
-    width: u32,
-    height: u32,
-    fps: u32,
+    info: Mutex<VideoInfo>,
     last_kf_request: Mutex<Instant>,
     error: Mutex<Option<String>>,
     /// Current encoder bitrate, reused when capture restarts.
@@ -103,16 +121,49 @@ impl Shared {
             }
         }
     }
+
+    /// Starts a capture with `cfg` next to the running one and switches
+    /// viewers over to it once it runs, so they never see a gap or disconnect.
+    /// Blocking. On failure the running capture is left as it was.
+    fn swap_capture(&self, cfg: CaptureConfig, label: Option<String>) -> Result<()> {
+        let _guard = self.swap_lock.lock().unwrap();
+        let generation = self.capture_gen.load(Ordering::SeqCst) + 1;
+        let mut cfg = cfg;
+        cfg.bitrate_kbps = self.bitrate_kbps.load(Ordering::Relaxed);
+        let cap = Capture::start(&cfg, (self.make_callbacks)(generation, cfg.fps))?;
+        let old = {
+            let mut slot = self.capture.lock().unwrap();
+            if *self.shutdown.borrow() {
+                drop(slot);
+                drop(cap);
+                return Ok(());
+            }
+            self.capture_gen.store(generation, Ordering::SeqCst);
+            // Its first keyframe may have been dropped before the switch.
+            cap.request_keyframe();
+            {
+                let mut info = self.info.lock().unwrap();
+                info.width = cap.width;
+                info.height = cap.height;
+                info.fps = cfg.fps;
+                if let Some(l) = label {
+                    info.source_label = l;
+                }
+            }
+            slot.replace(cap)
+        };
+        self.has_system_audio.store(cfg.audio != AudioCapture::None, Ordering::Relaxed);
+        *self.capture_cfg.lock().unwrap() = cfg;
+        *self.error.lock().unwrap() = None;
+        drop(old); // stops the old capture (blocking, outside the slot lock)
+        Ok(())
+    }
 }
 
 pub struct HostSession {
     shared: Arc<Shared>,
     shutdown_tx: watch::Sender<bool>,
     pub link: String,
-    pub width: u32,
-    pub height: u32,
-    pub fps: u32,
-    pub source_label: String,
     pub stats: Arc<Stats>,
     pub started: Instant,
     rt: tokio::runtime::Handle,
@@ -123,54 +174,67 @@ fn webrtc_runtime() -> Arc<dyn Runtime> {
     RT.get_or_init(|| webrtc::runtime::default_runtime().expect("tokio runtime feature")).clone()
 }
 
+/// Capture settings for a source, taken from the user's settings.
+pub fn capture_config(source: &SourceSelection, settings: &Settings) -> Result<CaptureConfig> {
+    let (max_w, max_h) = settings.resolution.bounds();
+    let audio = match settings.audio_mode {
+        AudioMode::Off => AudioCapture::None,
+        AudioMode::System => AudioCapture::SystemExcluding,
+        AudioMode::SingleApp => AudioCapture::SingleApp,
+    };
+    if audio == AudioCapture::SingleApp && settings.audio_app.is_none() {
+        return Err(anyhow!("Pick an app to capture audio from"));
+    }
+    Ok(CaptureConfig {
+        kind: source.kind,
+        id: source.id,
+        max_width: max_w,
+        max_height: max_h,
+        fps: settings.fps,
+        bitrate_kbps: (settings.bitrate_mbps * 1000.0) as u32,
+        audio,
+        audio_app: settings.audio_app.clone(),
+        excluded_apps: settings.excluded_apps.clone(),
+        mic: settings.capture_mic && crate::capture::mic_supported(),
+    })
+}
+
 impl HostSession {
     /// Starts capture, connects to relays and begins accepting viewers.
+    /// `room` decides the link; reuse it to keep the same link across sessions.
     /// Blocking (capture start waits on macOS); call off the UI thread.
-    pub fn start(source: SourceSelection, settings: &Settings, rt: tokio::runtime::Handle) -> Result<HostSession> {
+    pub fn start(source: SourceSelection, settings: &Settings, room: Room, rt: tokio::runtime::Handle) -> Result<HostSession> {
         let _guard = rt.enter();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (media_tx, _) = broadcast::channel::<MediaPacket>(512);
         let stats = Arc::new(Stats::default());
+        let capture_cfg = capture_config(&source, settings)?;
 
-        let (max_w, max_h) = settings.resolution.bounds();
-        let fps = settings.fps;
-        let want_mic = settings.capture_mic && crate::capture::mic_supported();
-        let audio_mode = match settings.audio_mode {
-            AudioMode::Off => AudioCapture::None,
-            AudioMode::System => AudioCapture::SystemExcluding,
-            AudioMode::SingleApp => AudioCapture::SingleApp,
-        };
-        if audio_mode == AudioCapture::SingleApp && settings.audio_app.is_none() {
-            return Err(anyhow!("Pick an app to capture audio from"));
-        }
-        let has_audio = audio_mode != AudioCapture::None || want_mic;
-
-        // Audio encoder thread.
+        // Audio is always negotiated, so it can be switched on while live.
+        let has_system_audio = Arc::new(AtomicBool::new(capture_cfg.audio != AudioCapture::None));
         let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<audio::Pcm>(64);
-        if has_audio {
-            audio::spawn_encoder(pcm_rx, media_tx.clone(), audio_mode != AudioCapture::None, stats.clone());
-        }
+        audio::spawn_encoder(pcm_rx, media_tx.clone(), has_system_audio.clone(), stats.clone());
 
         let error_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        // Builds a fresh set of callbacks, so capture can be restarted after
-        // it dies (display unplugged, lid closed, window gone, sleep).
-        let make_callbacks: Arc<dyn Fn() -> Callbacks + Send + Sync> = {
+        let capture_gen = Arc::new(AtomicU64::new(0));
+        // Builds the callbacks for one capture generation. Output is forwarded
+        // only while that generation is current.
+        let make_callbacks: MakeCallbacks = {
             let video_tx = media_tx.clone();
             let stats = stats.clone();
-            let last_pts = Arc::new(Mutex::new(None::<i64>));
-            let frame_us = 1_000_000 / fps.max(1) as i64;
             let err_slot = error_slot.clone();
-            Arc::new(move || {
-                let (video_tx, video_stats, audio_stats, last_pts, pcm_tx, err_slot) = (
-                    video_tx.clone(),
-                    stats.clone(),
-                    stats.clone(),
-                    last_pts.clone(),
-                    pcm_tx.clone(),
-                    err_slot.clone(),
-                );
+            let current = capture_gen.clone();
+            Arc::new(move |generation: u64, fps: u32| {
+                let last_pts = Mutex::new(None::<i64>);
+                let frame_us = 1_000_000 / fps.max(1) as i64;
+                let (video_tx, video_stats, audio_stats, pcm_tx, err_slot) =
+                    (video_tx.clone(), stats.clone(), stats.clone(), pcm_tx.clone(), err_slot.clone());
+                let (cur_v, cur_a, cur_e) = (current.clone(), current.clone(), current.clone());
                 Callbacks {
                     video: Box::new(move |data, pts, key| {
+                        if cur_v.load(Ordering::SeqCst) != generation {
+                            return;
+                        }
                         let mut last = last_pts.lock().unwrap();
                         let dur_us = match *last {
                             Some(prev) => (pts - prev).clamp(1_000, 1_000_000),
@@ -191,32 +255,25 @@ impl HostSession {
                         });
                     }),
                     audio: Box::new(move |samples, rate, _pts, mic| {
-                        if has_audio && pcm_tx.try_send(audio::Pcm { samples: samples.to_vec(), rate, mic }).is_err() {
+                        if cur_a.load(Ordering::SeqCst) != generation {
+                            return;
+                        }
+                        if pcm_tx.try_send(audio::Pcm { samples: samples.to_vec(), rate, mic }).is_err() {
                             audio_stats.audio_pcm_dropped.fetch_add(1, Ordering::Relaxed);
                         }
                     }),
                     error: Box::new(move |msg| {
-                        eprintln!("capture error: {msg}");
-                        *err_slot.lock().unwrap() = Some(msg);
+                        eprintln!("capture error (generation {generation}): {msg}");
+                        if cur_e.load(Ordering::SeqCst) == generation {
+                            *err_slot.lock().unwrap() = Some(msg);
+                        }
                     }),
                 }
             })
         };
 
-        let capture_cfg = CaptureConfig {
-            kind: source.kind,
-            id: source.id,
-            max_width: max_w,
-            max_height: max_h,
-            fps,
-            bitrate_kbps: (settings.bitrate_mbps * 1000.0) as u32,
-            audio: audio_mode,
-            audio_app: settings.audio_app.clone(),
-            excluded_apps: settings.excluded_apps.clone(),
-            mic: want_mic,
-        };
-        let capture = Capture::start(&capture_cfg, make_callbacks())?;
-        let (width, height) = (capture.width, capture.height);
+        let capture = Capture::start(&capture_cfg, make_callbacks(0, capture_cfg.fps))?;
+        let info = VideoInfo { source_label: source.label, width: capture.width, height: capture.height, fps: capture_cfg.fps };
 
         let mut ice_servers: Vec<IceServer> = vec![IceServer {
             urls: DEFAULT_STUN.iter().map(|s| s.to_string()).collect(),
@@ -236,42 +293,41 @@ impl HostSession {
             });
         }
 
-        let room = Room::generate();
         let relays: Vec<String> = settings.relays.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
         let link = room.link(settings.viewer_url.trim(), &relays);
         let (signaling, incoming) = Signaling::start(room, relays, shutdown_rx.clone());
 
         let shared = Arc::new(Shared {
             capture: Mutex::new(Some(capture)),
+            capture_gen,
+            capture_cfg: Mutex::new(capture_cfg),
+            swap_lock: Mutex::new(()),
+            make_callbacks,
+            has_system_audio,
             media_tx,
             signaling,
             viewers: Mutex::new(BTreeMap::new()),
             peers: Mutex::new(HashMap::new()),
             shutdown: shutdown_rx,
             ice_servers,
-            has_audio,
-            width,
-            height,
-            fps,
+            info: Mutex::new(info),
             last_kf_request: Mutex::new(Instant::now() - Duration::from_secs(1)),
             error: Mutex::new(None),
             bitrate_kbps: AtomicU32::new((settings.bitrate_mbps * 1000.0) as u32),
         });
-        spawn_capture_watchdog(shared.clone(), error_slot, capture_cfg, make_callbacks);
+        spawn_capture_watchdog(shared.clone(), error_slot);
         tokio::spawn(dispatch(shared.clone(), incoming));
 
-        Ok(HostSession {
-            shared,
-            shutdown_tx,
-            link,
-            width,
-            height,
-            fps,
-            source_label: source.label,
-            stats,
-            started: Instant::now(),
-            rt: rt.clone(),
-        })
+        Ok(HostSession { shared, shutdown_tx, link, stats, started: Instant::now(), rt: rt.clone() })
+    }
+
+    pub fn info(&self) -> VideoInfo {
+        self.shared.info.lock().unwrap().clone()
+    }
+
+    /// A handle for changing settings from another thread while live.
+    pub fn control(&self) -> Control {
+        Control(self.shared.clone())
     }
 
     pub fn viewers(&self) -> Vec<ViewerInfo> {
@@ -310,20 +366,43 @@ impl HostSession {
             std::thread::sleep(Duration::from_millis(400)); // let relays flush
         }
         let _ = self.shutdown_tx.send(true);
+        let _guard = self.shared.swap_lock.lock().unwrap();
         drop(self.shared.capture.lock().unwrap().take());
         let _ = self.rt;
     }
 }
 
+#[derive(Clone)]
+pub struct Control(Arc<Shared>);
+
+impl Control {
+    /// Applies new capture settings (resolution, fps, audio, or a different
+    /// source) while live: viewers stay connected. Blocking.
+    pub fn reconfigure(&self, source: Option<SourceSelection>, settings: &Settings) -> Result<()> {
+        let current = self.0.capture_cfg.lock().unwrap().clone();
+        let src = source.clone().unwrap_or(SourceSelection {
+            kind: current.kind,
+            id: current.id,
+            label: self.0.info.lock().unwrap().source_label.clone(),
+        });
+        let cfg = capture_config(&src, settings)?;
+        self.0.swap_capture(cfg, source.map(|s| s.label))?;
+        // Let watching viewers update their "1440p · 60 fps" label.
+        let info = self.0.info.lock().unwrap().clone();
+        let msg = SignalMessage::Info { width: info.width, height: info.height, fps: info.fps };
+        let pubkeys: Vec<String> = self.0.peers.lock().unwrap().values().map(|p| p.pubkey.clone()).collect();
+        for pk in &pubkeys {
+            self.0.signaling.send(Some(pk), &msg);
+        }
+        Ok(())
+    }
+
+}
+
 /// Watches for capture dying and restarts it while the session stays live.
 /// Viewers keep their connection; the picture freezes until capture is back,
 /// and the restarted encoder opens with a keyframe.
-fn spawn_capture_watchdog(
-    shared: Arc<Shared>,
-    err_slot: Arc<Mutex<Option<String>>>,
-    cfg: CaptureConfig,
-    make_callbacks: Arc<dyn Fn() -> Callbacks + Send + Sync>,
-) {
+fn spawn_capture_watchdog(shared: Arc<Shared>, err_slot: Arc<Mutex<Option<String>>>) {
     // Test hook: PTP_TEST_CAPTURE_LOSS=<secs> fakes a capture failure.
     let fake_loss = std::env::var("PTP_TEST_CAPTURE_LOSS").ok().and_then(|v| v.parse::<u64>().ok());
     let started = Instant::now();
@@ -347,7 +426,6 @@ fn spawn_capture_watchdog(
             if let Some(e) = err_slot.lock().unwrap().take() {
                 if !lost {
                     eprintln!("capture lost ({e}); will restart");
-                    drop(shared.capture.lock().unwrap().take());
                     lost = true;
                     attempts = 0;
                     next_try = Instant::now() + Duration::from_millis(500);
@@ -358,20 +436,11 @@ fn spawn_capture_watchdog(
                 continue;
             }
             attempts += 1;
-            let mut c = cfg.clone();
-            c.bitrate_kbps = shared.bitrate_kbps.load(Ordering::Relaxed);
-            match Capture::start(&c, make_callbacks()) {
-                Ok(cap) => {
-                    let mut slot = shared.capture.lock().unwrap();
-                    if *shutdown.borrow() {
-                        drop(slot);
-                        drop(cap);
-                        return;
-                    }
-                    eprintln!("capture restored after {attempts} attempt(s): {}x{}", cap.width, cap.height);
-                    *slot = Some(cap);
+            let cfg = shared.capture_cfg.lock().unwrap().clone();
+            match shared.swap_capture(cfg, None) {
+                Ok(()) => {
+                    eprintln!("capture restored after {attempts} attempt(s)");
                     lost = false;
-                    *shared.error.lock().unwrap() = None;
                     // Errors from the dead stream that raced in are stale.
                     err_slot.lock().unwrap().take();
                 }
@@ -389,6 +458,16 @@ fn spawn_capture_watchdog(
 
 async fn dispatch(shared: Arc<Shared>, mut incoming: mpsc::UnboundedReceiver<Incoming>) {
     let mut shutdown = shared.shutdown.clone();
+    // Viewer sessions known to be over. With a reused link, relays replay the
+    // last minute of messages on start, including hellos from viewers of the
+    // previous session; their answer or bye marks them as gone.
+    let mut dead: std::collections::HashSet<String> = Default::default();
+    let drop_ghost = |sid: &str, dead: &mut std::collections::HashSet<String>| {
+        dead.insert(sid.to_string());
+        if let Some(p) = shared.peers.lock().unwrap().get(sid) {
+            let _ = p.kick_tx.send(true);
+        }
+    };
     loop {
         let msg = tokio::select! {
             m = incoming.recv() => match m { Some(m) => m, None => return },
@@ -396,6 +475,9 @@ async fn dispatch(shared: Arc<Shared>, mut incoming: mpsc::UnboundedReceiver<Inc
         };
         match msg.msg {
             SignalMessage::Hello { sid, label } => {
+                if dead.contains(&sid) {
+                    continue;
+                }
                 let existing_offer = {
                     let peers = shared.peers.lock().unwrap();
                     match peers.get(&sid) {
@@ -436,20 +518,34 @@ async fn dispatch(shared: Arc<Shared>, mut incoming: mpsc::UnboundedReceiver<Inc
                 }
             }
             SignalMessage::Answer { sid, sdp } => {
-                if let Some(p) = shared.peers.lock().unwrap().get(&sid) {
-                    if p.pubkey == msg.from_pubkey {
-                        let _ = p.answer_tx.send(sdp);
+                let ours = {
+                    let peers = shared.peers.lock().unwrap();
+                    match peers.get(&sid) {
+                        Some(p) if p.pubkey == msg.from_pubkey => {
+                            // An answer before we sent any offer is a replay
+                            // from a previous session.
+                            if p.offer.lock().unwrap().is_some() {
+                                let _ = p.answer_tx.send(sdp);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        Some(_) => true,
+                        None => false,
                     }
+                };
+                if !ours {
+                    drop_ghost(&sid, &mut dead);
                 }
             }
             SignalMessage::Bye { sid } => {
-                if let Some(p) = shared.peers.lock().unwrap().get(&sid) {
-                    if p.pubkey == msg.from_pubkey {
-                        let _ = p.kick_tx.send(true);
-                    }
+                let theirs = shared.peers.lock().unwrap().get(&sid).map(|p| p.pubkey == msg.from_pubkey);
+                if theirs != Some(false) {
+                    drop_ghost(&sid, &mut dead);
                 }
             }
-            SignalMessage::Offer { .. } | SignalMessage::Ended => {}
+            SignalMessage::Offer { .. } | SignalMessage::Ended | SignalMessage::Info { .. } => {}
         }
     }
 }
@@ -557,7 +653,7 @@ async fn run_peer(
     for c in video_codecs() {
         media_engine.register_codec(c, RtpCodecKind::Video)?;
     }
-    if shared.has_audio {
+    {
         media_engine.register_codec(audio_codec(), RtpCodecKind::Audio)?;
     }
     let registry = register_default_interceptors(Registry::new(), &mut media_engine)?
@@ -625,12 +721,11 @@ async fn drive_peer(
             }
         }
     }
-    let audio = if shared.has_audio {
+    // Always offered, so audio can be switched on while live.
+    let audio = {
         let t = make_track(RtpCodecKind::Audio, audio_codec().rtp_codec)?;
         let s = pc.add_track(t.clone() as Arc<dyn TrackLocal>).await?;
         Some((t, s))
-    } else {
-        None
     };
 
     // Non-trickle ICE: gather everything, then send one offer.
@@ -638,13 +733,14 @@ async fn drive_peer(
     pc.set_local_description(offer).await?;
     let _ = tokio::time::timeout(Duration::from_secs(5), gathered_rx.recv()).await;
     let local = pc.local_description().await.ok_or_else(|| anyhow!("no local description"))?;
+    let info = shared.info.lock().unwrap().clone();
     let offer_msg = SignalMessage::Offer {
         sid: sid.to_string(),
         sdp: local.sdp.clone(),
         ice_servers: shared.ice_servers.clone(),
-        width: shared.width,
-        height: shared.height,
-        fps: shared.fps,
+        width: info.width,
+        height: info.height,
+        fps: info.fps,
     };
     *offer_slot.lock().unwrap() = Some(offer_msg.clone());
     shared.signaling.send(Some(pubkey), &offer_msg);

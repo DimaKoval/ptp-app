@@ -61,7 +61,7 @@ impl Resampler {
 pub fn spawn_encoder(
     rx: Receiver<Pcm>,
     out: broadcast::Sender<MediaPacket>,
-    has_system: bool,
+    has_system: Arc<std::sync::atomic::AtomicBool>,
     stats: Arc<Stats>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
@@ -108,6 +108,7 @@ pub fn spawn_encoder(
                     // System audio drives timing; mic alone drives it when there is
                     // no system audio or system audio went silent (SCK sends nothing).
                     let sys_ready = sys_q.len() >= FRAME * 2;
+                    let has_system = has_system.load(Ordering::Relaxed);
                     let mic_only = mic_q.len() >= FRAME * 2 && (!has_system || mic_q.len() >= FRAME * 2 * 3);
                     if !sys_ready && !mic_only {
                         break;
