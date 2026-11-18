@@ -195,7 +195,10 @@ pub fn run(rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("PTP Share")
             .with_inner_size([1120.0, 760.0])
-            .with_min_inner_size([900.0, 620.0]),
+            .with_min_inner_size([900.0, 620.0])
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png")).unwrap_or_default(),
+            ),
         ..Default::default()
     };
     eframe::run_native(
@@ -1001,8 +1004,13 @@ fn relaunch() {
 }
 
 fn pretty_bundle(bid: &str) -> String {
-    match bid {
-        "com.hnc.Discord" => "Discord".into(),
-        _ => bid.rsplit('.').next().unwrap_or(bid).to_string(),
+    if bid == crate::settings::DISCORD {
+        return "Discord".into();
     }
+    // Windows: "chrome.exe" → "Chrome". macOS: "com.google.Chrome" → "Chrome".
+    if let Some(stem) = bid.strip_suffix(".exe").or_else(|| bid.strip_suffix(".EXE")) {
+        let mut c = stem.chars();
+        return c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default();
+    }
+    bid.rsplit('.').next().unwrap_or(bid).to_string()
 }

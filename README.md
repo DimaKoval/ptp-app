@@ -42,6 +42,27 @@ If macOS keeps refusing access, reset the permission and grant it again:
 tccutil reset ScreenCapture dev.ptpshare.host
 ```
 
+## Windows (10 2004+ / 11)
+
+Download `ptp-share.exe` from the latest
+[Windows build](https://github.com/DimaKoval/ptp-app/actions/workflows/windows.yml)
+(or a [release](https://github.com/DimaKoval/ptp-app/releases)) and run it.
+It's a single self-contained file: no installer, no runtime to install.
+
+- Video: Windows.Graphics.Capture → GPU colour conversion → Media
+  Foundation H.264 (hardware encoder when available, software otherwise).
+- Audio: WASAPI process loopback: system audio minus Discord, or one app.
+- Windows SmartScreen may warn the first time, because the exe isn't
+  code-signed: click "More info" → "Run anyway".
+
+Build it yourself on Windows with `cargo build --release`
+(`target/release/ptp-share.exe`), or cross-compile from macOS:
+
+```bash
+brew install mingw-w64 && rustup target add x86_64-pc-windows-gnu
+cargo build --release --target x86_64-pc-windows-gnu
+```
+
 ## Settings
 
 - **Resolution:** 720p, 1080p or 1440p. The picture is scaled to fit and
@@ -84,7 +105,8 @@ audio chunks every 5 seconds.
 | Path | What |
 |---|---|
 | `native/macos/` | Objective-C layer: ScreenCaptureKit capture + VideoToolbox encoder, exposed through a C ABI (`ptp_capture.h`) |
-| `src/capture.rs` | Safe Rust wrapper for that layer |
+| `src/capture/macos.rs` | Safe Rust wrapper for that layer |
+| `src/capture/win/` | Windows backend: sources, WGC video, Media Foundation encoder, WASAPI audio |
 | `src/session.rs` | One WebRTC peer per viewer, sending the same encoded stream to all |
 | `src/signaling.rs` | Nostr relay pool, AES-GCM encryption, room links |
 | `src/audio.rs` | Mixing, resampling, Opus encoding |
@@ -96,5 +118,6 @@ audio chunks every 5 seconds.
 - There's no TURN server by default. Strict NATs (CGNAT, mobile hotspots)
   need one set in settings.
 - Every viewer gets the same bitrate.
-- The Windows host isn't built yet. It needs a Windows implementation of the
-  `ptp_capture.h` layer (Windows.Graphics.Capture + Media Foundation).
+- Windows: only one excluded app is left out of system audio (the first one
+  running, Discord by default), and only if it was running when sharing
+  started. The black-bar crop is macOS-only for now.

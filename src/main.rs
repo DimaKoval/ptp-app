@@ -1,3 +1,6 @@
+// Release builds on Windows are a GUI app: no console window.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod audio;
 mod capture;
 mod media;
@@ -12,6 +15,12 @@ use session::{HostSession, SourceSelection};
 use settings::Settings;
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    unsafe {
+        // Real pixel sizes for monitors and windows on scaled displays.
+        use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(4).build()?;
 
     // Headless modes (no UI), print the room link and live stats:

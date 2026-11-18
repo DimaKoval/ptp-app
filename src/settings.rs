@@ -75,6 +75,12 @@ pub struct Settings {
     pub turn_credential: String,
 }
 
+/// App id of Discord: a bundle id on macOS, the executable name on Windows.
+#[cfg(target_os = "macos")]
+pub const DISCORD: &str = "com.hnc.Discord";
+#[cfg(not(target_os = "macos"))]
+pub const DISCORD: &str = "discord.exe";
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -82,7 +88,7 @@ impl Default for Settings {
             fps: 60,
             bitrate_mbps: Resolution::P1080.suggested_mbps(60),
             audio_mode: AudioMode::System,
-            excluded_apps: vec!["com.hnc.Discord".into()],
+            excluded_apps: vec![DISCORD.into()],
             audio_app: None,
             capture_mic: false,
             viewer_url: DEFAULT_VIEWER_URL.into(),
