@@ -57,7 +57,7 @@ fn main() -> anyhow::Result<()> {
         let session = HostSession::start(source, &settings, rt.handle().clone())?;
         println!("Streaming {}x{}@{}", session.width, session.height, session.fps);
         println!("LINK {}", session.link);
-        let mut last = (0u64, 0u64);
+        let mut last = (0u64, 0u64, 0u64);
         loop {
             std::thread::sleep(std::time::Duration::from_secs(5));
             let relays = session.relay_status();
@@ -66,8 +66,11 @@ fn main() -> anyhow::Result<()> {
             let st = &session.stats;
             let ab = st.audio_bytes.load(std::sync::atomic::Ordering::Relaxed);
             let ap = st.audio_packets.load(std::sync::atomic::Ordering::Relaxed);
+            let vf = st.video_frames.load(std::sync::atomic::Ordering::Relaxed);
             println!(
-                "relays {}/{} | audio {} kbps, {} pkt/s, pcm dropped {} | viewers: {}",
+                "video {} fps{} | relays {}/{} | audio {} kbps, {} pkt/s, pcm dropped {} | viewers: {}",
+                (vf - last.2) / 5,
+                session.error().map(|e| format!(" [{e}]")).unwrap_or_default(),
                 up,
                 relays.len(),
                 (ab - last.0) * 8 / 5 / 1000,
@@ -75,7 +78,7 @@ fn main() -> anyhow::Result<()> {
                 st.audio_pcm_dropped.load(std::sync::atomic::Ordering::Relaxed),
                 viewers.iter().map(|v| format!("{}={:?}", v.label, v.state)).collect::<Vec<_>>().join(", ")
             );
-            last = (ab, ap);
+            last = (ab, ap, vf);
         }
     }
 

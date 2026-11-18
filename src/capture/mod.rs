@@ -76,6 +76,7 @@ pub enum AudioCapture {
     SingleApp,
 }
 
+#[derive(Clone)]
 pub struct CaptureConfig {
     pub kind: SourceKind,
     pub id: u32,

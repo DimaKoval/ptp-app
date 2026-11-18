@@ -21,7 +21,7 @@ use rtc::rtp_transceiver::rtp_sender::{
     RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind,
 };
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -79,6 +79,8 @@ struct Shared {
     fps: u32,
     last_kf_request: Mutex<Instant>,
     error: Mutex<Option<String>>,
+    /// Current encoder bitrate, reused when capture restarts.
+    bitrate_kbps: AtomicU32,
 }
 
 impl Shared {
@@ -150,59 +152,70 @@ impl HostSession {
         }
 
         let error_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        let video_tx = media_tx.clone();
-        let video_stats = stats.clone();
-        let last_pts = Mutex::new(None::<i64>);
-        let frame_us = 1_000_000 / fps.max(1) as i64;
-        let audio_stats = stats.clone();
-        let err_slot = error_slot.clone();
-        let callbacks = Callbacks {
-            video: Box::new(move |data, pts, key| {
-                let mut last = last_pts.lock().unwrap();
-                let dur_us = match *last {
-                    Some(prev) => (pts - prev).clamp(1_000, 1_000_000),
-                    None => frame_us,
-                };
-                *last = Some(pts);
-                video_stats.video_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
-                video_stats.video_frames.fetch_add(1, Ordering::Relaxed);
-                if key {
-                    video_stats.keyframes.fetch_add(1, Ordering::Relaxed);
+        // Builds a fresh set of callbacks, so capture can be restarted after
+        // it dies (display unplugged, lid closed, window gone, sleep).
+        let make_callbacks: Arc<dyn Fn() -> Callbacks + Send + Sync> = {
+            let video_tx = media_tx.clone();
+            let stats = stats.clone();
+            let last_pts = Arc::new(Mutex::new(None::<i64>));
+            let frame_us = 1_000_000 / fps.max(1) as i64;
+            let err_slot = error_slot.clone();
+            Arc::new(move || {
+                let (video_tx, video_stats, audio_stats, last_pts, pcm_tx, err_slot) = (
+                    video_tx.clone(),
+                    stats.clone(),
+                    stats.clone(),
+                    last_pts.clone(),
+                    pcm_tx.clone(),
+                    err_slot.clone(),
+                );
+                Callbacks {
+                    video: Box::new(move |data, pts, key| {
+                        let mut last = last_pts.lock().unwrap();
+                        let dur_us = match *last {
+                            Some(prev) => (pts - prev).clamp(1_000, 1_000_000),
+                            None => frame_us,
+                        };
+                        *last = Some(pts);
+                        video_stats.video_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        video_stats.video_frames.fetch_add(1, Ordering::Relaxed);
+                        if key {
+                            video_stats.keyframes.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let _ = video_tx.send(MediaPacket {
+                            kind: MediaKind::Video,
+                            data: Bytes::copy_from_slice(data),
+                            duration: Duration::from_micros(dur_us as u64),
+                            keyframe: key,
+                            pts_us: pts,
+                        });
+                    }),
+                    audio: Box::new(move |samples, rate, _pts, mic| {
+                        if has_audio && pcm_tx.try_send(audio::Pcm { samples: samples.to_vec(), rate, mic }).is_err() {
+                            audio_stats.audio_pcm_dropped.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }),
+                    error: Box::new(move |msg| {
+                        eprintln!("capture error: {msg}");
+                        *err_slot.lock().unwrap() = Some(msg);
+                    }),
                 }
-                let _ = video_tx.send(MediaPacket {
-                    kind: MediaKind::Video,
-                    data: Bytes::copy_from_slice(data),
-                    duration: Duration::from_micros(dur_us as u64),
-                    keyframe: key,
-                    pts_us: pts,
-                });
-            }),
-            audio: Box::new(move |samples, rate, _pts, mic| {
-                if has_audio && pcm_tx.try_send(audio::Pcm { samples: samples.to_vec(), rate, mic }).is_err() {
-                    audio_stats.audio_pcm_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }),
-            error: Box::new(move |msg| {
-                eprintln!("capture error: {msg}");
-                *err_slot.lock().unwrap() = Some(msg);
-            }),
+            })
         };
 
-        let capture = Capture::start(
-            &CaptureConfig {
-                kind: source.kind,
-                id: source.id,
-                max_width: max_w,
-                max_height: max_h,
-                fps,
-                bitrate_kbps: (settings.bitrate_mbps * 1000.0) as u32,
-                audio: audio_mode,
-                audio_app: settings.audio_app.clone(),
-                excluded_apps: settings.excluded_apps.clone(),
-                mic: want_mic,
-            },
-            callbacks,
-        )?;
+        let capture_cfg = CaptureConfig {
+            kind: source.kind,
+            id: source.id,
+            max_width: max_w,
+            max_height: max_h,
+            fps,
+            bitrate_kbps: (settings.bitrate_mbps * 1000.0) as u32,
+            audio: audio_mode,
+            audio_app: settings.audio_app.clone(),
+            excluded_apps: settings.excluded_apps.clone(),
+            mic: want_mic,
+        };
+        let capture = Capture::start(&capture_cfg, make_callbacks())?;
         let (width, height) = (capture.width, capture.height);
 
         let mut ice_servers: Vec<IceServer> = vec![IceServer {
@@ -242,25 +255,9 @@ impl HostSession {
             fps,
             last_kf_request: Mutex::new(Instant::now() - Duration::from_secs(1)),
             error: Mutex::new(None),
+            bitrate_kbps: AtomicU32::new((settings.bitrate_mbps * 1000.0) as u32),
         });
-        // Mirror capture errors into the shared error slot.
-        {
-            let shared = shared.clone();
-            let err_slot = error_slot.clone();
-            tokio::spawn(async move {
-                let mut sd = shared.shutdown.clone();
-                loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_millis(500)) => {
-                            if let Some(e) = err_slot.lock().unwrap().take() {
-                                *shared.error.lock().unwrap() = Some(e);
-                            }
-                        }
-                        _ = sd.changed() => return,
-                    }
-                }
-            });
-        }
+        spawn_capture_watchdog(shared.clone(), error_slot, capture_cfg, make_callbacks);
         tokio::spawn(dispatch(shared.clone(), incoming));
 
         Ok(HostSession {
@@ -290,6 +287,7 @@ impl HostSession {
     }
 
     pub fn set_bitrate(&self, kbps: u32) {
+        self.shared.bitrate_kbps.store(kbps, Ordering::Relaxed);
         if let Some(c) = self.shared.capture.lock().unwrap().as_ref() {
             c.set_bitrate(kbps);
         }
@@ -315,6 +313,78 @@ impl HostSession {
         drop(self.shared.capture.lock().unwrap().take());
         let _ = self.rt;
     }
+}
+
+/// Watches for capture dying and restarts it while the session stays live.
+/// Viewers keep their connection; the picture freezes until capture is back,
+/// and the restarted encoder opens with a keyframe.
+fn spawn_capture_watchdog(
+    shared: Arc<Shared>,
+    err_slot: Arc<Mutex<Option<String>>>,
+    cfg: CaptureConfig,
+    make_callbacks: Arc<dyn Fn() -> Callbacks + Send + Sync>,
+) {
+    // Test hook: PTP_TEST_CAPTURE_LOSS=<secs> fakes a capture failure.
+    let fake_loss = std::env::var("PTP_TEST_CAPTURE_LOSS").ok().and_then(|v| v.parse::<u64>().ok());
+    let started = Instant::now();
+    let _ = std::thread::Builder::new().name("capture-watchdog".into()).spawn(move || {
+        let shutdown = shared.shutdown.clone();
+        let mut lost = false;
+        let mut faked = false;
+        let mut next_try = Instant::now();
+        let mut attempts = 0u32;
+        loop {
+            std::thread::sleep(Duration::from_millis(250));
+            if *shutdown.borrow() {
+                return;
+            }
+            if let Some(secs) = fake_loss {
+                if !faked && started.elapsed() >= Duration::from_secs(secs) {
+                    faked = true;
+                    *err_slot.lock().unwrap() = Some("Capture stopped: simulated loss".into());
+                }
+            }
+            if let Some(e) = err_slot.lock().unwrap().take() {
+                if !lost {
+                    eprintln!("capture lost ({e}); will restart");
+                    drop(shared.capture.lock().unwrap().take());
+                    lost = true;
+                    attempts = 0;
+                    next_try = Instant::now() + Duration::from_millis(500);
+                    *shared.error.lock().unwrap() = Some(format!("{e}. Reconnecting automatically…"));
+                }
+            }
+            if !lost || Instant::now() < next_try {
+                continue;
+            }
+            attempts += 1;
+            let mut c = cfg.clone();
+            c.bitrate_kbps = shared.bitrate_kbps.load(Ordering::Relaxed);
+            match Capture::start(&c, make_callbacks()) {
+                Ok(cap) => {
+                    let mut slot = shared.capture.lock().unwrap();
+                    if *shutdown.borrow() {
+                        drop(slot);
+                        drop(cap);
+                        return;
+                    }
+                    eprintln!("capture restored after {attempts} attempt(s): {}x{}", cap.width, cap.height);
+                    *slot = Some(cap);
+                    lost = false;
+                    *shared.error.lock().unwrap() = None;
+                    // Errors from the dead stream that raced in are stale.
+                    err_slot.lock().unwrap().take();
+                }
+                Err(e) => {
+                    // Quick retries first, then settle at every 3 s.
+                    let wait = if attempts < 5 { 1000 } else { 3000 };
+                    next_try = Instant::now() + Duration::from_millis(wait);
+                    *shared.error.lock().unwrap() =
+                        Some(format!("Capture lost: {e}. Retrying — you're still live, viewers stay connected."));
+                }
+            }
+        }
+    });
 }
 
 async fn dispatch(shared: Arc<Shared>, mut incoming: mpsc::UnboundedReceiver<Incoming>) {
