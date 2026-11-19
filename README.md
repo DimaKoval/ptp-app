@@ -105,6 +105,11 @@ the shared screen or window (the **Change** button) all apply immediately.
 The app starts the new capture next to the running one and switches over, so
 viewers stay connected and see no gap. Network settings apply next time.
 
+**Black bars** around a video (letterboxing) are cropped off automatically,
+but only while the shared window, or the top window on a shared screen, is
+fullscreen. The crop lands about 0.6 s after the bars are stable (player
+controls hidden), and goes away as soon as the window leaves fullscreen.
+
 **Your link** stays the same every time you go live, so friends can bookmark
 it; a viewer page left open reconnects by itself when you go live again. The
 refresh button next to the link makes a new one (the old link stops working).
@@ -152,4 +157,4 @@ audio chunks every 5 seconds.
 - Every viewer gets the same bitrate.
 - Windows: only one excluded app is left out of system audio (the first one
   running, Discord by default), and only if it was running when sharing
-  started. The black-bar crop is macOS-only for now.
+  started.

@@ -9,6 +9,7 @@
 
 mod audio;
 mod encoder;
+mod letterbox;
 mod sources;
 mod video;
 

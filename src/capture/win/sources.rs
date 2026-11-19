@@ -69,7 +69,7 @@ fn pretty_exe(exe: &str) -> String {
     c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
 }
 
-fn window_rect(h: HWND) -> Option<RECT> {
+pub(crate) fn window_rect(h: HWND) -> Option<RECT> {
     let mut r = RECT::default();
     unsafe {
         DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &mut r as *mut _ as *mut c_void, size_of::<RECT>() as u32)

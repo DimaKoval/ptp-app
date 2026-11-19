@@ -115,7 +115,10 @@ fn run_inner(
     }
 
     let mut out: Vec<Encoded> = Vec::new();
-    let mut last: Option<ID3D11Texture2D> = None;
+    // Our own copy of the newest frame: re-sent while the screen is static,
+    // and measured for black bars (a paused video sends no new frames).
+    let mut held: Option<(ID3D11Texture2D, u32, u32)> = None;
+    let mut lb = super::letterbox::Letterbox::new(cfg.kind, cfg.id);
     let mut last_encode = Instant::now();
     let mut last_pts = 0i64;
     let mut cand: Option<((u32, u32), Instant)> = None;
@@ -134,6 +137,7 @@ fn run_inner(
             latest = Some(f);
         }
 
+        let mut fresh_pts = None;
         if let Some(frame) = latest {
             let content: SizeInt32 = frame.ContentSize()?;
             if content.Width > 0 && content.Height > 0 && (content.Width != pool_size.Width || content.Height != pool_size.Height) {
@@ -143,48 +147,82 @@ fn run_inner(
                 pool.Recreate(&d3d, format, 2, pool_size)?;
                 vp.forget_inputs();
             }
-            let target = fit_size(content.Width.max(1) as u32, content.Height.max(1) as u32, cfg.max_width, cfg.max_height);
-            if target != (enc_w, enc_h) {
-                match cand {
-                    Some((c, since)) if c == target && since.elapsed() >= Duration::from_millis(300) => {
-                        (enc_w, enc_h) = target;
-                        encoder = Encoder::new(&device, &context, enc_w, enc_h, cfg.fps, bitrate)?;
-                        shared.force_key.store(true, Ordering::SeqCst);
-                        cand = None;
-                    }
-                    Some((c, _)) if c == target => {}
-                    _ => cand = Some((target, Instant::now())),
-                }
-            } else {
-                cand = None;
-            }
-
             let surface = frame.Surface()?;
             let access: IDirect3DDxgiInterfaceAccess = surface.cast()?;
             let tex: ID3D11Texture2D = unsafe { access.GetInterface()? };
-            let src = RECT { left: 0, top: 0, right: content.Width, bottom: content.Height };
-            let nv12 = vp.convert(&tex, src, enc_w, enc_h)?;
-            let mut pts = frame.SystemRelativeTime()?.Duration / 10;
-            if pts <= last_pts {
-                pts = last_pts + 1000;
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { tex.GetDesc(&mut desc) };
+            let w = (content.Width.max(1) as u32).min(desc.Width);
+            let h = (content.Height.max(1) as u32).min(desc.Height);
+            if held.as_ref().map(|x| (x.1, x.2)) != Some((w, h)) {
+                let copy_desc = D3D11_TEXTURE2D_DESC {
+                    Width: w,
+                    Height: h,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: desc.Format,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Usage: D3D11_USAGE_DEFAULT,
+                    // Same binding as the capture frames, which the video
+                    // processor already accepts as input.
+                    BindFlags: desc.BindFlags,
+                    CPUAccessFlags: 0,
+                    MiscFlags: 0,
+                };
+                let mut t = None;
+                unsafe { device.CreateTexture2D(&copy_desc, None, Some(&mut t))? };
+                held = Some((t.unwrap(), w, h));
+                vp.forget_inputs();
             }
+            let dst = &held.as_ref().unwrap().0;
+            let b = D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
+            unsafe { context.CopySubresourceRegion(dst, 0, 0, 0, 0, &tex, 0, Some(&b)) };
+            fresh_pts = Some(frame.SystemRelativeTime()?.Duration / 10);
+            drop(frame); // back to the pool right away
+        }
+        let Some((src_tex, cw, ch)) = held.clone() else {
+            encoder.poll(&mut out)?;
+            continue;
+        };
+
+        // Black bars (fullscreen only); a crop change applies immediately.
+        let lb_changed = lb.update(&device, &context, &src_tex, cw, ch);
+        let src = lb.crop().unwrap_or(RECT { left: 0, top: 0, right: cw as i32, bottom: ch as i32 });
+        let target = fit_size((src.right - src.left) as u32, (src.bottom - src.top) as u32, cfg.max_width, cfg.max_height);
+        if target != (enc_w, enc_h) {
+            match cand {
+                _ if lb_changed => {
+                    (enc_w, enc_h) = target;
+                    encoder = Encoder::new(&device, &context, enc_w, enc_h, cfg.fps, bitrate)?;
+                    shared.force_key.store(true, Ordering::SeqCst);
+                    cand = None;
+                }
+                Some((c, since)) if c == target && since.elapsed() >= Duration::from_millis(300) => {
+                    (enc_w, enc_h) = target;
+                    encoder = Encoder::new(&device, &context, enc_w, enc_h, cfg.fps, bitrate)?;
+                    shared.force_key.store(true, Ordering::SeqCst);
+                    cand = None;
+                }
+                Some((c, _)) if c == target => {}
+                _ => cand = Some((target, Instant::now())),
+            }
+        } else {
+            cand = None;
+        }
+
+        // Encode new frames; while the screen is static re-send the last
+        // picture now and then, right away when a viewer asks for a
+        // keyframe, and when the crop changed.
+        let idle = last_encode.elapsed();
+        let key_wanted = shared.force_key.load(Ordering::SeqCst);
+        if fresh_pts.is_some() || lb_changed || idle > Duration::from_millis(500) || (key_wanted && idle > Duration::from_millis(40)) {
+            let nv12 = vp.convert(&src_tex, src, enc_w, enc_h)?;
+            // Capture time for new frames, now for re-sends.
+            let pts = fresh_pts.unwrap_or_else(qpc_us).max(last_pts + 1000);
             last_pts = pts;
             let key = shared.force_key.swap(false, Ordering::SeqCst);
             encoder.encode(&nv12, pts, key, &mut out)?;
-            last = Some(nv12);
             last_encode = Instant::now();
-        } else if let Some(nv12) = &last {
-            // Nothing changed on screen: re-send the last picture now and then,
-            // and right away when a viewer asks for a keyframe.
-            let idle = last_encode.elapsed();
-            let key_wanted = shared.force_key.load(Ordering::SeqCst);
-            if idle > Duration::from_millis(500) || (key_wanted && idle > Duration::from_millis(40)) {
-                let pts = qpc_us().max(last_pts + 1000);
-                last_pts = pts;
-                let key = shared.force_key.swap(false, Ordering::SeqCst);
-                encoder.encode(nv12, pts, key, &mut out)?;
-                last_encode = Instant::now();
-            }
         }
 
         encoder.poll(&mut out)?;
@@ -308,8 +346,8 @@ impl Converter {
         }
         let in_view = self.inputs[&key].clone();
         let src = RECT {
-            left: 0,
-            top: 0,
+            left: src.left.max(0),
+            top: src.top.max(0),
             right: src.right.min(desc.Width as i32),
             bottom: src.bottom.min(desc.Height as i32),
         };
