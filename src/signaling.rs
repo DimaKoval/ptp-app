@@ -139,6 +139,9 @@ pub enum SignalMessage {
         sid: String,
         #[serde(default)]
         label: String,
+        /// The viewer's browser can decode AV1 smoothly (in hardware).
+        #[serde(default)]
+        av1: bool,
     },
     /// host → viewer
     Offer {
@@ -148,6 +151,8 @@ pub enum SignalMessage {
         width: u32,
         height: u32,
         fps: u32,
+        #[serde(default)]
+        codec: String,
     },
     /// viewer → host
     Answer { sid: String, sdp: String },
@@ -156,7 +161,13 @@ pub enum SignalMessage {
     /// host → viewer: stream is over
     Ended,
     /// host → viewer: the stream's size or frame rate changed
-    Info { width: u32, height: u32, fps: u32 },
+    Info {
+        width: u32,
+        height: u32,
+        fps: u32,
+        #[serde(default)]
+        codec: String,
+    },
 }
 
 /// A decrypted message plus who sent it.

@@ -1069,17 +1069,29 @@ impl App {
                     });
                 });
                 let info = session.info();
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(format!("{}  ·  {}×{} @ {} fps", info.source_label, info.width, info.height, info.fps))
+                            .size(14.0)
                             .color(MUTED),
                     );
-                    if ui
-                        .add_enabled(self.reconfig_rx.is_none(), egui::Button::new(format!("{}  Change", icon::SWAP)).small())
-                        .clicked()
-                    {
-                        pick_source = true;
-                    }
+                    let color = if info.codec == crate::capture::VideoCodec::Av1 { GREEN } else { MUTED };
+                    ui.scope(|ui| badge(ui, info.codec.label(), color))
+                        .response
+                        .on_hover_text(format!("Video codec: {} — {}.", info.codec.label(), info.codec_reason));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let btn = egui::Button::new(
+                            RichText::new(format!("{}  Change source", icon::SWAP)).size(14.0).strong().color(Color32::WHITE),
+                        )
+                        .fill(ACCENT_SOFT)
+                        .stroke(Stroke::new(1.0, ACCENT))
+                        .corner_radius(8)
+                        .min_size(Vec2::new(150.0, 34.0));
+                        if ui.add_enabled(self.reconfig_rx.is_none(), btn).clicked() {
+                            pick_source = true;
+                        }
+                    });
                 });
                 ui.add_space(12.0);
 
@@ -1114,6 +1126,14 @@ impl App {
                             ViewerState::Negotiating => badge(ui, "Joining", AMBER),
                             ViewerState::Connecting => badge(ui, "Connecting", AMBER),
                             ViewerState::Connected => badge(ui, "Watching", GREEN),
+                        }
+                        if crate::capture::av1_supported() {
+                            let (txt, color, tip) = if v.av1 {
+                                ("AV1", ACCENT, "This viewer's browser decodes AV1 in hardware.")
+                            } else {
+                                ("H.264 only", MUTED, "This viewer can't decode AV1 smoothly, so everyone gets H.264.")
+                            };
+                            ui.scope(|ui| badge(ui, txt, color)).response.on_hover_text(tip);
                         }
                         ui.label(RichText::new(fmt_dur(v.since.elapsed())).size(12.0).color(MUTED));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

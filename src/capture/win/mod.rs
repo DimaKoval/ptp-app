@@ -2,8 +2,8 @@
 //!
 //! * Sources and thumbnails: Win32 window/monitor enumeration + GDI.
 //! * Video: Windows.Graphics.Capture → D3D11 video processor (BGRA → NV12,
-//!   scaling, BT.709) → Media Foundation H.264 encoder (hardware MFT when
-//!   available, Microsoft's software encoder otherwise).
+//!   scaling, BT.709) → Media Foundation encoder: AV1 (hardware only) or H.264 (hardware
+//!   MFT when available, Microsoft's software encoder otherwise).
 //! * Audio: WASAPI process loopback (system audio minus one app's process
 //!   tree, or a single app), plus the default microphone if asked.
 
@@ -35,6 +35,13 @@ pub fn mic_supported() -> bool {
     true
 }
 
+/// True when this PC has a hardware AV1 encoder (NVIDIA RTX 40+, AMD RX 7000+,
+/// Intel Arc / Core Ultra). Probed once.
+pub fn av1_supported() -> bool {
+    static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS.get_or_init(encoder::has_hardware_av1)
+}
+
 /// What the capture threads need, copied out of `CaptureConfig`.
 #[derive(Clone)]
 pub(crate) struct Config {
@@ -47,6 +54,7 @@ pub(crate) struct Config {
     pub audio: AudioCapture,
     pub audio_app: Option<String>,
     pub excluded_apps: Vec<String>,
+    pub codec: VideoCodec,
 }
 
 /// State shared between the `Capture` handle and its threads.
@@ -80,6 +88,7 @@ impl Capture {
             audio: cfg.audio,
             audio_app: cfg.audio_app.clone(),
             excluded_apps: cfg.excluded_apps.clone(),
+            codec: cfg.codec,
         };
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),

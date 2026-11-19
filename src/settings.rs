@@ -14,6 +14,8 @@ pub enum Resolution {
 /// Widest frame the H.264 hardware encoders accept (VideoToolbox, NVENC,
 /// AMF and Quick Sync all stop at 4096).
 pub const MAX_ENCODE_WIDTH: u32 = 4096;
+/// AV1 hardware encoders go to 8192, so ultrawide screens stay native.
+pub const MAX_AV1_ENCODE_WIDTH: u32 = 8192;
 
 impl Resolution {
     pub const ALL: [Resolution; 4] = [Resolution::P720, Resolution::P1080, Resolution::P1440, Resolution::P2160];

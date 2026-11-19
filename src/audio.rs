@@ -136,6 +136,7 @@ pub fn spawn_encoder(
                                 duration: Duration::from_millis(20),
                                 keyframe: false,
                                 pts_us: 0,
+                                codec: Default::default(),
                             });
                         }
                         Err(e) => eprintln!("opus encode: {e}"),

@@ -76,6 +76,23 @@ pub enum AudioCapture {
     SingleApp,
 }
 
+/// Video codec of the encoded stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoCodec {
+    #[default]
+    H264,
+    Av1,
+}
+
+impl VideoCodec {
+    pub fn label(self) -> &'static str {
+        match self {
+            VideoCodec::H264 => "H.264",
+            VideoCodec::Av1 => "AV1",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct CaptureConfig {
     pub kind: SourceKind,
@@ -88,10 +105,13 @@ pub struct CaptureConfig {
     pub audio_app: Option<String>,
     pub excluded_apps: Vec<String>,
     pub mic: bool,
+    /// Ignored on macOS (H.264 only).
+    pub codec: VideoCodec,
 }
 
 pub struct Callbacks {
-    /// Annex-B H.264 access unit, presentation time (µs), keyframe flag.
+    /// One encoded frame (Annex-B H.264 access unit or AV1 temporal unit of
+    /// OBUs), presentation time (µs), keyframe flag.
     pub video: Box<dyn Fn(&[u8], i64, bool) + Send + Sync>,
     /// Interleaved stereo f32, sample rate, pts (µs), is_mic.
     pub audio: Box<dyn Fn(&[f32], u32, i64, bool) + Send + Sync>,

@@ -84,6 +84,11 @@ pub fn mic_supported() -> bool {
     unsafe { ptp_mic_supported() != 0 }
 }
 
+/// VideoToolbox has no AV1 encoder.
+pub fn av1_supported() -> bool {
+    false
+}
+
 extern "C" fn on_video(ctx: *mut c_void, data: *const u8, len: usize, pts: i64, key: i32) {
     let cbs = unsafe { &*(ctx as *const Callbacks) };
     let slice = unsafe { std::slice::from_raw_parts(data, len) };

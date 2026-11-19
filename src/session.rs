@@ -1,20 +1,20 @@
 //! A live hosting session: capture → encode once → fan out to every viewer's
 //! own WebRTC peer connection. Signaling runs over Nostr relays.
 
-use crate::capture::{AudioCapture, Callbacks, Capture, CaptureConfig, SourceKind};
+use crate::capture::{AudioCapture, Callbacks, Capture, CaptureConfig, SourceKind, VideoCodec};
 use crate::media::{MediaKind, MediaPacket, Stats};
-use crate::settings::{AudioMode, Settings};
+use crate::settings::{AudioMode, MAX_AV1_ENCODE_WIDTH, MAX_ENCODE_WIDTH, Settings};
 use crate::signaling::{IceServer, Incoming, RelayStatus, Room, SignalMessage, Signaling};
 use crate::{audio, rtcp_forward::RtcpForwarder};
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use rtc::interceptor::{Registry, Slot};
 use rtc::media::Sample;
-use rtc::rtp::packetizer::Packetizer;
+use rtc::rtp::packetizer::Payloader;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
-use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS, MediaEngine};
+use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_AV1, MIME_TYPE_H264, MIME_TYPE_OPUS, MediaEngine};
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::peer_connection::transport::RTCIceServer;
 use rtc::rtp_transceiver::rtp_sender::{
@@ -50,6 +50,8 @@ pub struct ViewerInfo {
     pub label: String,
     pub state: ViewerState,
     pub since: Instant,
+    /// Can receive AV1 (said so in its hello, and accepted it in its answer).
+    pub av1: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +68,9 @@ pub struct VideoInfo {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    pub codec: VideoCodec,
+    /// Why that codec, e.g. "Chrome on macOS can't decode AV1".
+    pub codec_reason: String,
 }
 
 struct PeerHandle {
@@ -75,7 +80,7 @@ struct PeerHandle {
     offer: Arc<Mutex<Option<SignalMessage>>>,
 }
 
-type MakeCallbacks = Arc<dyn Fn(u64, u32) -> Callbacks + Send + Sync>;
+type MakeCallbacks = Arc<dyn Fn(u64, u32, VideoCodec) -> Callbacks + Send + Sync>;
 
 struct Shared {
     capture: Mutex<Option<Capture>>,
@@ -99,6 +104,11 @@ struct Shared {
     error: Mutex<Option<String>>,
     /// Current encoder bitrate, reused when capture restarts.
     bitrate_kbps: AtomicU32,
+    /// Codec every capture (re)start uses: AV1 while every viewer can take it.
+    wanted_codec: Mutex<VideoCodec>,
+    /// The AV1 encoder failed to start once; stay on H.264.
+    av1_failed: AtomicBool,
+    codec_check_pending: AtomicBool,
 }
 
 impl Shared {
@@ -130,7 +140,9 @@ impl Shared {
         let generation = self.capture_gen.load(Ordering::SeqCst) + 1;
         let mut cfg = cfg;
         cfg.bitrate_kbps = self.bitrate_kbps.load(Ordering::Relaxed);
-        let cap = Capture::start(&cfg, (self.make_callbacks)(generation, cfg.fps))?;
+        cfg.codec = *self.wanted_codec.lock().unwrap();
+        cfg.max_width = if cfg.codec == VideoCodec::Av1 { MAX_AV1_ENCODE_WIDTH } else { MAX_ENCODE_WIDTH };
+        let cap = Capture::start(&cfg, (self.make_callbacks)(generation, cfg.fps, cfg.codec))?;
         let old = {
             let mut slot = self.capture.lock().unwrap();
             if *self.shutdown.borrow() {
@@ -146,6 +158,7 @@ impl Shared {
                 info.width = cap.width;
                 info.height = cap.height;
                 info.fps = cfg.fps;
+                info.codec = cfg.codec;
                 if let Some(l) = label {
                     info.source_label = l;
                 }
@@ -157,6 +170,72 @@ impl Shared {
         *self.error.lock().unwrap() = None;
         drop(old); // stops the old capture (blocking, outside the slot lock)
         Ok(())
+    }
+
+    /// Tells watching viewers the stream's size, frame rate or codec changed.
+    fn broadcast_info(&self) {
+        let info = self.info.lock().unwrap().clone();
+        let msg = SignalMessage::Info { width: info.width, height: info.height, fps: info.fps, codec: info.codec.label().into() };
+        let pubkeys: Vec<String> = self.peers.lock().unwrap().values().map(|p| p.pubkey.clone()).collect();
+        for pk in &pubkeys {
+            self.signaling.send(Some(pk), &msg);
+        }
+    }
+
+    /// The codec the stream should use now, and why. None: keep the current
+    /// one (nobody is watching).
+    fn desired_codec(&self) -> Option<(VideoCodec, String)> {
+        if !crate::capture::av1_supported() {
+            return Some((VideoCodec::H264, "this computer has no hardware AV1 encoder".into()));
+        }
+        if self.av1_failed.load(Ordering::SeqCst) {
+            return Some((VideoCodec::H264, "the AV1 encoder failed to start".into()));
+        }
+        let viewers = self.viewers.lock().unwrap();
+        if viewers.is_empty() {
+            return None;
+        }
+        let blockers: Vec<String> = viewers.values().filter(|v| !v.av1).map(|v| v.label.clone()).collect();
+        Some(if blockers.is_empty() {
+            (VideoCodec::Av1, "every viewer can decode AV1".into())
+        } else {
+            (VideoCodec::H264, format!("{} can't decode AV1 smoothly", blockers.join(", ")))
+        })
+    }
+
+    /// Re-picks the codec after viewers came or went, and switches the
+    /// encoder (like a live settings change) if needed. Debounced, so a
+    /// viewer reconnecting doesn't flip the codec back and forth.
+    fn check_codec(self: &Arc<Self>) {
+        if self.codec_check_pending.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let shared = self.clone();
+        let _ = std::thread::Builder::new().name("codec-switch".into()).spawn(move || {
+            std::thread::sleep(Duration::from_millis(600));
+            shared.codec_check_pending.store(false, Ordering::SeqCst);
+            if *shared.shutdown.borrow() {
+                return;
+            }
+            let Some((codec, reason)) = shared.desired_codec() else { return };
+            shared.info.lock().unwrap().codec_reason = reason;
+            *shared.wanted_codec.lock().unwrap() = codec;
+            let cfg = shared.capture_cfg.lock().unwrap().clone();
+            if cfg.codec == codec {
+                return;
+            }
+            eprintln!("switching video codec to {}", codec.label());
+            if let Err(e) = shared.swap_capture(cfg, None) {
+                eprintln!("{} encoder failed: {e}", codec.label());
+                if codec == VideoCodec::Av1 {
+                    shared.av1_failed.store(true, Ordering::SeqCst);
+                    *shared.wanted_codec.lock().unwrap() = VideoCodec::H264;
+                    shared.info.lock().unwrap().codec_reason = "the AV1 encoder failed to start".into();
+                }
+                return;
+            }
+            shared.broadcast_info();
+        });
     }
 }
 
@@ -196,6 +275,8 @@ pub fn capture_config(source: &SourceSelection, settings: &Settings) -> Result<C
         audio_app: settings.audio_app.clone(),
         excluded_apps: settings.excluded_apps.clone(),
         mic: settings.capture_mic && crate::capture::mic_supported(),
+        // Picked per viewer set; swap_capture fills in the current choice.
+        codec: VideoCodec::H264,
     })
 }
 
@@ -224,7 +305,7 @@ impl HostSession {
             let stats = stats.clone();
             let err_slot = error_slot.clone();
             let current = capture_gen.clone();
-            Arc::new(move |generation: u64, fps: u32| {
+            Arc::new(move |generation: u64, fps: u32, codec: VideoCodec| {
                 let last_pts = Mutex::new(None::<i64>);
                 let frame_us = 1_000_000 / fps.max(1) as i64;
                 let (video_tx, video_stats, audio_stats, pcm_tx, err_slot) =
@@ -252,6 +333,7 @@ impl HostSession {
                             duration: Duration::from_micros(dur_us as u64),
                             keyframe: key,
                             pts_us: pts,
+                            codec,
                         });
                     }),
                     audio: Box::new(move |samples, rate, _pts, mic| {
@@ -272,8 +354,22 @@ impl HostSession {
             })
         };
 
-        let capture = Capture::start(&capture_cfg, make_callbacks(0, capture_cfg.fps))?;
-        let info = VideoInfo { source_label: source.label, width: capture.width, height: capture.height, fps: capture_cfg.fps };
+        // Starts on H.264 (every browser plays it); switches to AV1 once
+        // viewers that can all decode it are watching.
+        let capture = Capture::start(&capture_cfg, make_callbacks(0, capture_cfg.fps, capture_cfg.codec))?;
+        let codec_reason = if crate::capture::av1_supported() {
+            "AV1 is used once every viewer can decode it".to_string()
+        } else {
+            "this computer has no hardware AV1 encoder".to_string()
+        };
+        let info = VideoInfo {
+            source_label: source.label,
+            width: capture.width,
+            height: capture.height,
+            fps: capture_cfg.fps,
+            codec: capture_cfg.codec,
+            codec_reason,
+        };
 
         let mut ice_servers: Vec<IceServer> = vec![IceServer {
             urls: DEFAULT_STUN.iter().map(|s| s.to_string()).collect(),
@@ -314,6 +410,9 @@ impl HostSession {
             last_kf_request: Mutex::new(Instant::now() - Duration::from_secs(1)),
             error: Mutex::new(None),
             bitrate_kbps: AtomicU32::new((settings.bitrate_mbps * 1000.0) as u32),
+            wanted_codec: Mutex::new(VideoCodec::H264),
+            av1_failed: AtomicBool::new(false),
+            codec_check_pending: AtomicBool::new(false),
         });
         spawn_capture_watchdog(shared.clone(), error_slot);
         tokio::spawn(dispatch(shared.clone(), incoming));
@@ -388,12 +487,7 @@ impl Control {
         let cfg = capture_config(&src, settings)?;
         self.0.swap_capture(cfg, source.map(|s| s.label))?;
         // Let watching viewers update their "1440p · 60 fps" label.
-        let info = self.0.info.lock().unwrap().clone();
-        let msg = SignalMessage::Info { width: info.width, height: info.height, fps: info.fps };
-        let pubkeys: Vec<String> = self.0.peers.lock().unwrap().values().map(|p| p.pubkey.clone()).collect();
-        for pk in &pubkeys {
-            self.0.signaling.send(Some(pk), &msg);
-        }
+        self.0.broadcast_info();
         Ok(())
     }
 
@@ -474,7 +568,7 @@ async fn dispatch(shared: Arc<Shared>, mut incoming: mpsc::UnboundedReceiver<Inc
             _ = shutdown.changed() => return,
         };
         match msg.msg {
-            SignalMessage::Hello { sid, label } => {
+            SignalMessage::Hello { sid, label, av1 } => {
                 if dead.contains(&sid) {
                     continue;
                 }
@@ -502,8 +596,17 @@ async fn dispatch(shared: Arc<Shared>, mut incoming: mpsc::UnboundedReceiver<Inc
                         let label = if label.trim().is_empty() { "Viewer".to_string() } else { label.chars().take(40).collect() };
                         shared.viewers.lock().unwrap().insert(
                             sid.clone(),
-                            ViewerInfo { sid: sid.clone(), label, state: ViewerState::Negotiating, since: Instant::now() },
+                            ViewerInfo {
+                                sid: sid.clone(),
+                                label,
+                                state: ViewerState::Negotiating,
+                                since: Instant::now(),
+                                av1: av1 && crate::capture::av1_supported(),
+                            },
                         );
+                        // A viewer without AV1 switches the stream to H.264
+                        // while it is still negotiating.
+                        shared.check_codec();
                         let shared2 = shared.clone();
                         let pubkey = msg.from_pubkey.clone();
                         tokio::spawn(async move {
@@ -513,6 +616,7 @@ async fn dispatch(shared: Arc<Shared>, mut incoming: mpsc::UnboundedReceiver<Inc
                             }
                             shared2.peers.lock().unwrap().remove(&sid);
                             shared2.viewers.lock().unwrap().remove(&sid);
+                            shared2.check_codec();
                         });
                     }
                 }
@@ -564,6 +668,22 @@ impl PeerConnectionEventHandler for PeerEvents {
     }
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
         let _ = self.state.send(state);
+    }
+}
+
+const AV1_PT: u8 = 45;
+
+fn av1_codec() -> RTCRtpCodecParameters {
+    RTCRtpCodecParameters {
+        rtp_codec: RTCRtpCodec {
+            mime_type: MIME_TYPE_AV1.to_owned(),
+            clock_rate: 90000,
+            channels: 0,
+            sdp_fmtp_line: "profile=0".to_owned(),
+            rtcp_feedback: h264_feedback(),
+        },
+        payload_type: AV1_PT,
+        ..Default::default()
     }
 }
 
@@ -626,6 +746,71 @@ fn make_track(kind: RtpCodecKind, codec: RTCRtpCodec) -> Result<Arc<TrackLocalSt
     )?))
 }
 
+/// Negotiated payload types for each video codec the viewer accepted.
+async fn negotiated_video(sender: &Arc<dyn RtpSender>) -> Result<(Option<u8>, Option<u8>)> {
+    let codecs = sender.get_parameters().await?.rtp_parameters.codecs;
+    let pt = |mime: &str| codecs.iter().find(|c| c.rtp_codec.mime_type.eq_ignore_ascii_case(mime)).map(|c| c.payload_type);
+    Ok((pt(MIME_TYPE_H264), pt(MIME_TYPE_AV1)))
+}
+
+/// Turns encoded frames into RTP packets for one viewer. One SSRC, sequence
+/// and timestamp across codec switches: the payload type tells the browser
+/// which decoder a frame is for (switches always start at a keyframe).
+struct VideoRtp {
+    ssrc: u32,
+    seq: u16,
+    ts_base: u32,
+    h264: Option<(u8, Box<dyn Payloader>)>,
+    av1: Option<(u8, Box<dyn Payloader>)>,
+}
+
+impl VideoRtp {
+    fn new(ssrc: u32, h264_pt: Option<u8>, av1_pt: Option<u8>) -> VideoRtp {
+        VideoRtp {
+            ssrc,
+            seq: rand::random(),
+            ts_base: rand::random(),
+            h264: h264_pt.map(|pt| (pt, Box::<rtc::rtp::codec::h264::H264Payloader>::default() as Box<dyn Payloader>)),
+            av1: av1_pt.map(|pt| (pt, Box::<rtc::rtp::codec::av1::Av1Payloader>::default() as Box<dyn Payloader>)),
+        }
+    }
+
+    fn accepts(&self, codec: VideoCodec) -> bool {
+        match codec {
+            VideoCodec::H264 => self.h264.is_some(),
+            VideoCodec::Av1 => self.av1.is_some(),
+        }
+    }
+
+    fn packetize(&mut self, codec: VideoCodec, ticks: u64, data: &Bytes) -> Result<Vec<rtc::rtp::Packet>> {
+        let (pt, payloader) = match codec {
+            VideoCodec::H264 => self.h264.as_mut(),
+            VideoCodec::Av1 => self.av1.as_mut(),
+        }
+        .ok_or_else(|| anyhow!("{} not negotiated", codec.label()))?;
+        let payloads = payloader.payload(1200 - 12, data)?;
+        let n = payloads.len();
+        let timestamp = self.ts_base.wrapping_add(ticks as u32);
+        let mut out = Vec::with_capacity(n);
+        for (i, payload) in payloads.into_iter().enumerate() {
+            self.seq = self.seq.wrapping_add(1);
+            out.push(rtc::rtp::Packet {
+                header: rtc::rtp::Header {
+                    version: 2,
+                    marker: i == n - 1,
+                    payload_type: *pt,
+                    sequence_number: self.seq,
+                    timestamp,
+                    ssrc: self.ssrc,
+                    ..Default::default()
+                },
+                payload,
+            });
+        }
+        Ok(out)
+    }
+}
+
 async fn negotiated(sender: &Arc<dyn RtpSender>, track: &Arc<TrackLocalStaticSample>) -> Result<(u32, u8)> {
     let pt = sender
         .get_parameters()
@@ -653,6 +838,7 @@ async fn run_peer(
     for c in video_codecs() {
         media_engine.register_codec(c, RtpCodecKind::Video)?;
     }
+    media_engine.register_codec(av1_codec(), RtpCodecKind::Video)?;
     {
         media_engine.register_codec(audio_codec(), RtpCodecKind::Audio)?;
     }
@@ -713,11 +899,17 @@ async fn drive_peer(
 ) -> Result<()> {
     let video_track = make_track(RtpCodecKind::Video, video_codecs()[0].rtp_codec.clone())?;
     let video_sender = pc.add_track(video_track.clone() as Arc<dyn TrackLocal>).await?;
-    // add_track only offers the track's own codec; offer every H.264 profile id.
+    // add_track only offers the track's own codec; offer every H.264 profile
+    // id, plus AV1 first to viewers that can decode it.
+    let offer_av1 = shared.viewers.lock().unwrap().get(sid).is_some_and(|v| v.av1);
+    let mut offered = video_codecs();
+    if offer_av1 {
+        offered.insert(0, av1_codec());
+    }
     for t in pc.get_transceivers().await {
         if let Ok(Some(s)) = t.sender().await {
             if s.id() == video_sender.id() {
-                t.set_codec_preferences(video_codecs()).await?;
+                t.set_codec_preferences(offered.clone()).await?;
             }
         }
     }
@@ -741,6 +933,7 @@ async fn drive_peer(
         width: info.width,
         height: info.height,
         fps: info.fps,
+        codec: info.codec.label().into(),
     };
     *offer_slot.lock().unwrap() = Some(offer_msg.clone());
     shared.signaling.send(Some(pubkey), &offer_msg);
@@ -778,7 +971,15 @@ async fn drive_peer(
     }
     shared.set_viewer_state(sid, ViewerState::Connected);
 
-    let (vssrc, vpt) = negotiated(&video_sender, &video_track).await?;
+    let vssrc = *video_track.ssrcs().await.first().ok_or_else(|| anyhow!("track has no ssrc"))?;
+    let (h264_pt, av1_pt) = negotiated_video(&video_sender).await?;
+    if av1_pt.is_none() && offer_av1 {
+        // Offered, but the browser's answer left it out.
+        if let Some(v) = shared.viewers.lock().unwrap().get_mut(sid) {
+            v.av1 = false;
+        }
+        shared.check_codec();
+    }
     let audio = match audio {
         Some((t, s)) => {
             let (ssrc, pt) = negotiated(&s, &t).await?;
@@ -805,15 +1006,7 @@ async fn drive_peer(
     // unevenly spaced frames (a 24/30 fps video on a 60 Hz screen) got each
     // other's timing and played back with a judder. Here every frame's RTP
     // timestamp is its own capture time.
-    let mut vpack = rtc::rtp::packetizer::new_packetizer(
-        Instant::now(),
-        1200,
-        vpt,
-        vssrc,
-        video_codecs()[0].rtp_codec.payloader()?,
-        Box::new(rtc::rtp::sequence::new_random_sequencer()),
-        90_000,
-    );
+    let mut vpack = VideoRtp::new(vssrc, h264_pt, av1_pt);
     let mut video_base: Option<i64> = None; // pts of the first frame sent
     let mut video_ticks: u64 = 0; // 90 kHz ticks advanced so far
 
@@ -825,17 +1018,22 @@ async fn drive_peer(
             pkt = media_rx.recv() => match pkt {
                 Ok(p) => match p.kind {
                     MediaKind::Video => {
+                        // A codec this viewer can't take (the stream is
+                        // switching to one it can): wait for its keyframe.
+                        if !vpack.accepts(p.codec) {
+                            waiting_for_key = true;
+                            continue;
+                        }
                         if waiting_for_key && !p.keyframe {
                             continue;
                         }
                         waiting_for_key = false;
                         let base = *video_base.get_or_insert(p.pts_us);
                         let target = ((p.pts_us - base).max(0) as u64) * 90_000 / 1_000_000;
-                        if target > video_ticks {
-                            vpack.skip_samples((target - video_ticks) as u32);
-                            video_ticks = target;
-                        }
-                        match vpack.packetize(Instant::now(), &p.data, 0) {
+                        // Never backwards (a new capture's clock may start
+                        // slightly behind the old one's).
+                        video_ticks = video_ticks.max(target);
+                        match vpack.packetize(p.codec, video_ticks, &p.data) {
                             Ok(packets) => {
                                 for pkt in packets {
                                     if let Err(e) = video_track.write_rtp(pkt).await {

@@ -74,7 +74,8 @@ Download `ptp-share.exe` from the latest
 It's a single self-contained file: no installer, no runtime to install.
 
 - Video: Windows.Graphics.Capture → GPU colour conversion → Media
-  Foundation H.264 (hardware encoder when available, software otherwise).
+  Foundation AV1 or H.264 (hardware encoder when available; H.264 falls
+  back to software). See **Video codec** below.
 - Audio: WASAPI process loopback: system audio minus Discord, or one app.
 - Windows SmartScreen may warn the first time, because the exe isn't
   code-signed: click "More info" → "Run anyway".
@@ -102,8 +103,18 @@ cargo build --release --target x86_64-pc-windows-gnu
   `https://dimakoval.github.io/ptp-web/`), an optional TURN server, and the
   signaling relays.
 
+**Video codec:** the stream starts as H.264, which every browser plays. On a
+Windows PC with a hardware AV1 encoder (NVIDIA RTX 40+, AMD RX 7000+, Intel
+Arc / Core Ultra) it switches to AV1 while every viewer's browser can decode
+AV1 in hardware, and back to H.264 as soon as one that can't joins. AV1
+looks better at the same bitrate and keeps ultrawide screens at native
+width (up to 8192 px). The live screen shows the codec in use (hover it for
+why) and which viewers can take AV1; the viewer's info panel (i) shows it
+too. Add `&codec=h264` or `&codec=av1` to a viewer link to override that
+viewer's check, for testing.
+
 **Changing things while live:** resolution, frame rate, bitrate, audio and
-the shared screen or window (the **Change** button) all apply immediately.
+the shared screen or window (the **Change source** button) all apply immediately.
 The app starts the new capture next to the running one and switches over, so
 viewers stay connected and see no gap. Network settings apply next time.
 

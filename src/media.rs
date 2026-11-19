@@ -8,7 +8,7 @@ pub enum MediaKind {
     Audio,
 }
 
-/// One encoded unit (H.264 access unit or Opus frame), shared by all viewers.
+/// One encoded unit (H.264 access unit, AV1 temporal unit or Opus frame), shared by all viewers.
 #[derive(Debug, Clone)]
 pub struct MediaPacket {
     pub kind: MediaKind,
@@ -17,6 +17,8 @@ pub struct MediaPacket {
     pub keyframe: bool,
     /// Capture time (µs, host clock). Drives video RTP timestamps.
     pub pts_us: i64,
+    /// Video only: which codec `data` is in.
+    pub codec: crate::capture::VideoCodec,
 }
 
 #[derive(Default)]

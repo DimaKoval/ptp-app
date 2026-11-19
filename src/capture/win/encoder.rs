@@ -1,9 +1,11 @@
-//! H.264 encoding with Media Foundation.
+//! H.264 / AV1 encoding with Media Foundation.
 //!
 //! Prefers a hardware encoder MFT (NVIDIA / AMD / Intel), which takes D3D11
-//! NV12 textures directly and works asynchronously. Falls back to
-//! Microsoft's software H.264 encoder (synchronous, fed from CPU memory).
-//! Output is Annex-B; SPS/PPS are added to keyframes if missing.
+//! NV12 textures directly and works asynchronously. H.264 falls back to
+//! Microsoft's software encoder (synchronous, fed from CPU memory); AV1 is
+//! hardware only.
+//! H.264 output is Annex-B with SPS/PPS added to keyframes if missing; AV1
+//! output is a temporal unit of OBUs with the sequence header on keyframes.
 
 use std::mem::ManuallyDrop;
 use std::sync::Once;
@@ -12,6 +14,8 @@ use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::System::Variant::VARIANT;
 use windows::core::{GUID, Interface, Result};
+
+use crate::capture::VideoCodec;
 
 pub(super) struct Encoded {
     pub data: Vec<u8>,
@@ -36,6 +40,48 @@ pub(super) struct Encoder {
     width: u32,
     height: u32,
     fps: u32,
+    kind: VideoCodec,
+}
+
+fn subtype(codec: VideoCodec) -> GUID {
+    match codec {
+        VideoCodec::H264 => MFVideoFormat_H264,
+        VideoCodec::Av1 => MFVideoFormat_AV1,
+    }
+}
+
+/// Hardware encoder MFTs taking NV12 and producing `codec`, best first.
+fn hardware_encoders(codec: VideoCodec) -> Vec<IMFActivate> {
+    startup();
+    let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_NV12 };
+    let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: subtype(codec) };
+    let mut list: *mut Option<IMFActivate> = std::ptr::null_mut();
+    let mut count = 0u32;
+    unsafe {
+        if MFTEnumEx(
+            MFT_CATEGORY_VIDEO_ENCODER,
+            MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+            Some(&input),
+            Some(&output),
+            &mut list,
+            &mut count,
+        )
+        .is_err()
+        {
+            return Vec::new();
+        }
+        let v = (0..count as usize).filter_map(|i| (*list.add(i)).take()).collect();
+        if !list.is_null() {
+            CoTaskMemFree(Some(list as *const _));
+        }
+        v
+    }
+}
+
+pub(super) fn has_hardware_av1() -> bool {
+    let found = !hardware_encoders(VideoCodec::Av1).is_empty();
+    eprintln!("hardware AV1 encoder: {}", if found { "found" } else { "not found" });
+    found
 }
 
 fn startup() {
@@ -67,9 +113,20 @@ fn set_common(t: &IMFMediaType, w: u32, h: u32, fps: u32) -> Result<()> {
 }
 
 impl Encoder {
-    pub fn new(device: &ID3D11Device, context: &ID3D11DeviceContext, w: u32, h: u32, fps: u32, kbps: u32) -> Result<Encoder> {
+    pub fn new(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        codec: VideoCodec,
+        w: u32,
+        h: u32,
+        fps: u32,
+        kbps: u32,
+    ) -> Result<Encoder> {
         startup();
-        match Self::hardware(device, context, w, h, fps, kbps) {
+        if codec == VideoCodec::Av1 {
+            return Self::hardware(device, context, codec, w, h, fps, kbps);
+        }
+        match Self::hardware(device, context, codec, w, h, fps, kbps) {
             Ok(e) => Ok(e),
             Err(hw_err) => {
                 eprintln!("hardware H.264 encoder unavailable ({hw_err}); using software encoder");
@@ -78,31 +135,19 @@ impl Encoder {
         }
     }
 
-    fn hardware(device: &ID3D11Device, context: &ID3D11DeviceContext, w: u32, h: u32, fps: u32, kbps: u32) -> Result<Encoder> {
-        let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_NV12 };
-        let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_H264 };
-        let mut list: *mut Option<IMFActivate> = std::ptr::null_mut();
-        let mut count = 0u32;
-        unsafe {
-            MFTEnumEx(
-                MFT_CATEGORY_VIDEO_ENCODER,
-                MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-                Some(&input),
-                Some(&output),
-                &mut list,
-                &mut count,
-            )?;
-        }
-        let activates: Vec<IMFActivate> = unsafe {
-            let v = (0..count as usize).filter_map(|i| (*list.add(i)).take()).collect();
-            if !list.is_null() {
-                CoTaskMemFree(Some(list as *const _));
-            }
-            v
-        };
-        let mut last_err = windows::core::Error::new(MF_E_NOT_FOUND, "no hardware H.264 encoder");
-        for act in activates {
-            match Self::try_hardware(&act, device, context, w, h, fps, kbps) {
+    #[allow(clippy::too_many_arguments)]
+    fn hardware(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        codec: VideoCodec,
+        w: u32,
+        h: u32,
+        fps: u32,
+        kbps: u32,
+    ) -> Result<Encoder> {
+        let mut last_err = windows::core::Error::new(MF_E_NOT_FOUND, format!("no hardware {} encoder", codec.label()));
+        for act in hardware_encoders(codec) {
+            match Self::try_hardware(&act, device, context, codec, w, h, fps, kbps) {
                 Ok(e) => return Ok(e),
                 Err(e) => last_err = e,
             }
@@ -110,10 +155,12 @@ impl Encoder {
         Err(last_err)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn try_hardware(
         act: &IMFActivate,
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
+        codec: VideoCodec,
         w: u32,
         h: u32,
         fps: u32,
@@ -145,6 +192,7 @@ impl Encoder {
                 width: w,
                 height: h,
                 fps,
+                kind: codec,
             };
             enc.configure(kbps)?;
             Ok(enc)
@@ -167,6 +215,7 @@ impl Encoder {
                 width: w,
                 height: h,
                 fps,
+                kind: VideoCodec::H264,
             };
             enc.configure(kbps)?;
             Ok(enc)
@@ -193,9 +242,13 @@ impl Encoder {
         unsafe {
             let out = MFCreateMediaType()?;
             set_common(&out, w, h, fps)?;
-            out.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+            out.SetGUID(&MF_MT_SUBTYPE, &subtype(self.kind))?;
             out.SetUINT32(&MF_MT_AVG_BITRATE, kbps * 1000)?;
-            out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
+            let profile = match self.kind {
+                VideoCodec::H264 => eAVEncH264VProfile_High.0 as u32,
+                VideoCodec::Av1 => eAVEncAV1VProfile_Main_420_8.0 as u32,
+            };
+            out.SetUINT32(&MF_MT_MPEG2_PROFILE, profile)?;
             self.mft.SetOutputType(0, &out, 0)?;
 
             // Pick the encoder's own NV12 input type, then fill in the details.
@@ -358,7 +411,11 @@ impl Encoder {
             media.Lock(&mut ptr, None, Some(&mut len))?;
             let bytes = std::slice::from_raw_parts(ptr, len as usize).to_vec();
             let _ = media.Unlock();
-            out.push(Encoded { data: self.annex_b(bytes, key), pts_us, key });
+            let data = match self.kind {
+                VideoCodec::H264 => self.annex_b(bytes, key),
+                VideoCodec::Av1 => self.av1_with_seq_header(bytes, key),
+            };
+            out.push(Encoded { data, pts_us, key });
             Ok(true)
         }
     }
@@ -373,6 +430,27 @@ impl Encoder {
             v.splice(0..0, [0, 0, 0, 1]);
         }
         v.extend_from_slice(&data);
+        v
+    }
+
+    /// AV1 keyframes must carry the sequence header OBU for a decoder to
+    /// start; add it from the media type if the encoder left it out.
+    fn av1_with_seq_header(&self, data: Vec<u8>, key: bool) -> Vec<u8> {
+        if !key || self.seq_header.is_empty() || av1_has_seq_header(&data) {
+            return data;
+        }
+        // The blob may be an AV1CodecConfigurationRecord (av1C): a 4-byte
+        // header, then the config OBUs.
+        let obus = if self.seq_header.len() > 4 && self.seq_header[0] == 0x81 { &self.seq_header[4..] } else { &self.seq_header[..] };
+        if !av1_has_seq_header(obus) {
+            return data;
+        }
+        // Keep the temporal delimiter (if any) first.
+        let td = av1_obus(&data).first().filter(|(t, _, _)| *t == 2).map(|(_, _, end)| *end).unwrap_or(0);
+        let mut v = Vec::with_capacity(obus.len() + data.len());
+        v.extend_from_slice(&data[..td]);
+        v.extend_from_slice(obus);
+        v.extend_from_slice(&data[td..]);
         v
     }
 
@@ -445,4 +523,42 @@ fn has_sps(data: &[u8]) -> bool {
         }
     }
     false
+}
+
+/// (type, start, end) of each OBU in a low-overhead AV1 bitstream. Stops at
+/// the first OBU without a size field.
+fn av1_obus(data: &[u8]) -> Vec<(u8, usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        let header = data[i];
+        let typ = (header >> 3) & 0x0f;
+        let has_ext = header & 0x04 != 0;
+        let has_size = header & 0x02 != 0;
+        let mut p = i + 1 + has_ext as usize;
+        if !has_size {
+            break;
+        }
+        let (mut size, mut shift) = (0usize, 0);
+        loop {
+            let Some(&b) = data.get(p) else { return out };
+            p += 1;
+            size |= ((b & 0x7f) as usize) << shift;
+            shift += 7;
+            if b & 0x80 == 0 || shift > 56 {
+                break;
+            }
+        }
+        let end = p + size;
+        if end > data.len() {
+            break;
+        }
+        out.push((typ, i, end));
+        i = end;
+    }
+    out
+}
+
+fn av1_has_seq_header(data: &[u8]) -> bool {
+    av1_obus(data).iter().any(|(t, _, _)| *t == 1)
 }

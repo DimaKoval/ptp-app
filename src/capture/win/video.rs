@@ -95,10 +95,15 @@ fn run_inner(
     let item = capture_item(cfg)?;
     let mut pool_size = item.Size()?;
     let format = DirectXPixelFormat::B8G8R8A8UIntNormalized;
-    let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&d3d, format, 2, pool_size)?;
+    let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&d3d, format, 3, pool_size)?;
     let session: GraphicsCaptureSession = pool.CreateCaptureSession(&item)?;
     let _ = session.SetIsCursorCaptureEnabled(true);
-    let _ = session.SetIsBorderRequired(false); // Windows 11; harmless to fail
+    // Windows 11 24H2+ may otherwise throttle frame delivery (~60 fps);
+    // ask for frames as often as the display produces them.
+    let _ = session.SetMinUpdateInterval(windows::Foundation::TimeSpan { Duration: 10_000 }); // 1 ms
+    if borderless_allowed() {
+        let _ = session.SetIsBorderRequired(false); // Windows 11+; older systems keep the border
+    }
     let (frame_tx, frame_rx) = mpsc::channel::<()>();
     pool.FrameArrived(&TypedEventHandler::new(move |_, _| {
         let _ = frame_tx.send(());
@@ -107,7 +112,7 @@ fn run_inner(
 
     let (mut enc_w, mut enc_h) = fit_size(pool_size.Width as u32, pool_size.Height as u32, cfg.max_width, cfg.max_height);
     let mut vp = Converter::new(&device, &context, cfg.fps)?;
-    let mut encoder = Encoder::new(&device, &context, enc_w, enc_h, cfg.fps, cfg.bitrate_kbps)?;
+    let mut encoder = Encoder::new(&device, &context, cfg.codec, enc_w, enc_h, cfg.fps, cfg.bitrate_kbps)?;
     let mut bitrate = cfg.bitrate_kbps;
     session.StartCapture()?;
     if let Some(tx) = ready.take() {
@@ -144,7 +149,7 @@ fn run_inner(
                 // The window was resized: grow/shrink the frame pool now, the
                 // encoder once the new size has been stable for 300 ms.
                 pool_size = content;
-                pool.Recreate(&d3d, format, 2, pool_size)?;
+                pool.Recreate(&d3d, format, 3, pool_size)?;
                 vp.forget_inputs();
             }
             let surface = frame.Surface()?;
@@ -193,13 +198,13 @@ fn run_inner(
             match cand {
                 _ if lb_changed => {
                     (enc_w, enc_h) = target;
-                    encoder = Encoder::new(&device, &context, enc_w, enc_h, cfg.fps, bitrate)?;
+                    encoder = Encoder::new(&device, &context, cfg.codec, enc_w, enc_h, cfg.fps, bitrate)?;
                     shared.force_key.store(true, Ordering::SeqCst);
                     cand = None;
                 }
                 Some((c, since)) if c == target && since.elapsed() >= Duration::from_millis(300) => {
                     (enc_w, enc_h) = target;
-                    encoder = Encoder::new(&device, &context, enc_w, enc_h, cfg.fps, bitrate)?;
+                    encoder = Encoder::new(&device, &context, cfg.codec, enc_w, enc_h, cfg.fps, bitrate)?;
                     shared.force_key.store(true, Ordering::SeqCst);
                     cand = None;
                 }
@@ -369,4 +374,23 @@ impl Converter {
         }
         Ok(out_tex)
     }
+}
+
+/// The yellow capture border can only be turned off after asking Windows for
+/// borderless access (granted automatically to unpackaged desktop apps on
+/// Windows 11). Asked once per process; false on systems without the API.
+fn borderless_allowed() -> bool {
+    use std::sync::OnceLock;
+    use windows::Graphics::Capture::{GraphicsCaptureAccess, GraphicsCaptureAccessKind};
+    use windows::Security::Authorization::AppCapabilityAccess::AppCapabilityAccessStatus;
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| {
+        let status = GraphicsCaptureAccess::RequestAccessAsync(GraphicsCaptureAccessKind::Borderless)
+            .and_then(|op| op.join());
+        let ok = matches!(status, Ok(AppCapabilityAccessStatus::Allowed));
+        if !ok {
+            eprintln!("borderless capture not available: {status:?}");
+        }
+        ok
+    })
 }
