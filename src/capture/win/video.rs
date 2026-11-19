@@ -127,9 +127,20 @@ fn run_inner(
     let mut last_encode = Instant::now();
     let mut last_pts = 0i64;
     let mut cand: Option<((u32, u32), Instant)> = None;
+    // Frame-rate cap: Windows delivers every frame the screen shows (a game
+    // at 240 fps would be encoded 240 times a second). Encode at most one
+    // frame per slot of 1/fps, always the newest; a frame that arrives early
+    // waits for its slot (under one frame time).
+    let interval = Duration::from_secs_f64(1.0 / cfg.fps.max(1) as f64);
+    let mut next_due = Instant::now();
+    let mut pending_pts: Option<i64> = None;
 
     while !shared.stop.load(Ordering::SeqCst) {
-        let _ = frame_rx.recv_timeout(Duration::from_millis(20));
+        let wait = match pending_pts {
+            Some(_) => next_due.saturating_duration_since(Instant::now()).min(Duration::from_millis(20)),
+            None => Duration::from_millis(20),
+        };
+        let _ = frame_rx.recv_timeout(wait);
         let kbps = shared.bitrate_kbps.load(Ordering::SeqCst);
         if kbps != bitrate {
             bitrate = kbps;
@@ -142,7 +153,6 @@ fn run_inner(
             latest = Some(f);
         }
 
-        let mut fresh_pts = None;
         if let Some(frame) = latest {
             let content: SizeInt32 = frame.ContentSize()?;
             if content.Width > 0 && content.Height > 0 && (content.Width != pool_size.Width || content.Height != pool_size.Height) {
@@ -182,7 +192,7 @@ fn run_inner(
             let dst = &held.as_ref().unwrap().0;
             let b = D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
             unsafe { context.CopySubresourceRegion(dst, 0, 0, 0, 0, &tex, 0, Some(&b)) };
-            fresh_pts = Some(frame.SystemRelativeTime()?.Duration / 10);
+            pending_pts = Some(frame.SystemRelativeTime()?.Duration / 10);
             drop(frame); // back to the pool right away
         }
         let Some((src_tex, cw, ch)) = held.clone() else {
@@ -218,12 +228,17 @@ fn run_inner(
         // Encode new frames; while the screen is static re-send the last
         // picture now and then, right away when a viewer asks for a
         // keyframe, and when the crop changed.
-        let idle = last_encode.elapsed();
+        let now = Instant::now();
+        let idle = now - last_encode;
         let key_wanted = shared.force_key.load(Ordering::SeqCst);
-        if fresh_pts.is_some() || lb_changed || idle > Duration::from_millis(500) || (key_wanted && idle > Duration::from_millis(40)) {
+        let fresh_due = pending_pts.is_some() && now >= next_due;
+        if fresh_due || lb_changed || idle > Duration::from_millis(500) || (key_wanted && idle > Duration::from_millis(40)) {
+            // Next slot one frame time on; if we fell behind by more than a
+            // frame, restart the schedule rather than bursting to catch up.
+            next_due = (next_due + interval).max(now + interval / 2);
             let nv12 = vp.convert(&src_tex, src, enc_w, enc_h)?;
             // Capture time for new frames, now for re-sends.
-            let pts = fresh_pts.unwrap_or_else(qpc_us).max(last_pts + 1000);
+            let pts = pending_pts.take().unwrap_or_else(qpc_us).max(last_pts + 1000);
             last_pts = pts;
             let key = shared.force_key.swap(false, Ordering::SeqCst);
             encoder.encode(&nv12, pts, key, &mut out)?;
