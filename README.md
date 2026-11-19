@@ -89,8 +89,10 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 ## Settings
 
-- **Resolution:** 720p, 1080p, 1440p (default) or 4K. The picture is scaled
-  to fit and never upscaled.
+- **Resolution:** 720p, 1080p, 1440p (default) or 4K (2160 lines). The
+  preset caps the height; width follows your screen's shape up to 4096 px,
+  the H.264 hardware encoders' limit (a 5120×1440 ultrawide streams as
+  4096×1152 at 1440p or 4K). Never upscaled.
 - **Frame rate:** 30, 60 or 120 fps.
 - **Bitrate:** your upload needs about bitrate × viewers.
 - **Audio:** off, system audio minus excluded apps (Discord is excluded by

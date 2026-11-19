@@ -37,6 +37,15 @@ fn main() -> anyhow::Result<()> {
         if let Some(url) = args.get(2) {
             settings.viewer_url = url.clone();
         }
+        // Test hook: PTP_RESOLUTION=720|1080|1440|2160.
+        if let Ok(r) = std::env::var("PTP_RESOLUTION") {
+            settings.resolution = match r.as_str() {
+                "720" => settings::Resolution::P720,
+                "1080" => settings::Resolution::P1080,
+                "2160" => settings::Resolution::P2160,
+                _ => settings::Resolution::P1440,
+            };
+        }
         let source = if let Some(app) = window_app {
             let list = capture::list_sources()?;
             let needle = app.to_lowercase();
@@ -49,7 +58,13 @@ fn main() -> anyhow::Result<()> {
             SourceSelection { kind: SourceKind::Window, id: w.id, label: w.title.clone() }
         } else if mode == Some("--display") {
             let list = capture::list_sources()?;
-            let d = list.displays.iter().find(|d| d.is_main).or(list.displays.first()).ok_or_else(|| anyhow::anyhow!("no display"))?;
+            // Test hook: PTP_DISPLAY=<n> picks the n-th display (1-based).
+            let pick = std::env::var("PTP_DISPLAY").ok().and_then(|v| v.parse::<usize>().ok());
+            let d = match pick {
+                Some(n) => list.displays.get(n.saturating_sub(1)),
+                None => list.displays.iter().find(|d| d.is_main).or(list.displays.first()),
+            }
+            .ok_or_else(|| anyhow::anyhow!("no display"))?;
             SourceSelection { kind: SourceKind::Display, id: d.id, label: d.name.clone() }
         } else {
             SourceSelection { kind: SourceKind::TestPattern, id: 0, label: "Test pattern".into() }

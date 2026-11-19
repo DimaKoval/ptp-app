@@ -225,6 +225,10 @@ struct App {
     live_source: Option<(SourceKind, u32, String)>,
     pending_source: Option<(SourceKind, u32, String)>,
     picking_source: bool,
+    /// Sources refresh on their own: when the app gets focus, and every
+    /// 10 s while the picker is on screen.
+    was_focused: bool,
+    last_refresh: Instant,
     show_network: bool,
     relays_text: String,
     window_filter: String,
@@ -265,6 +269,8 @@ impl App {
             live_source: None,
             pending_source: None,
             picking_source: false,
+            was_focused: true,
+            last_refresh: Instant::now(),
             settings,
             sources: SourceList::default(),
             sources_rx: None,
@@ -292,6 +298,7 @@ impl App {
     }
 
     fn refresh_sources(&mut self, ctx: &egui::Context) {
+        self.last_refresh = Instant::now();
         let (tx, rx) = channel();
         self.sources_rx = Some(rx);
         let ctx = ctx.clone();
@@ -400,6 +407,23 @@ impl App {
         });
     }
 
+    /// Keeps the screen/window list current without a Refresh button: on
+    /// regaining focus (you probably opened or closed windows meanwhile) and
+    /// every 10 s while the picker is visible.
+    fn auto_refresh(&mut self, ctx: &egui::Context) {
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        let picker_visible = self.session.is_none() || self.picking_source;
+        let due = focused && picker_visible && self.last_refresh.elapsed() >= Duration::from_secs(10);
+        let regained = focused && !self.was_focused;
+        self.was_focused = focused;
+        if (regained || due) && self.sources_rx.is_none() {
+            self.refresh_sources(ctx);
+        }
+        if focused && picker_visible {
+            ctx.request_repaint_after(Duration::from_secs(10));
+        }
+    }
+
     /// The saved room (same link every session); makes one the first time.
     fn room(&mut self) -> Room {
         if let Some(r) = Room::from_saved(&self.settings.room_secret) {
@@ -482,6 +506,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
+        self.auto_refresh(&ctx);
         debug_screenshot(&ctx);
         // Debug: PTP_UI_AUTOSTART=1 starts sharing the first screen (with
         // PTP_UI_SHOT, to screenshot the live view); =pick also opens the
@@ -628,14 +653,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Choose what to share").size(20.0).strong());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let refreshing = self.sources_rx.is_some();
-                if ui
-                    .add_enabled(!refreshing, egui::Button::new(format!("{}  Refresh", icon::ARROWS_CLOCKWISE)))
-                    .clicked()
-                {
-                    self.refresh_sources(&ctx);
-                }
-                if refreshing {
+                if self.sources_rx.is_some() {
                     ui.spinner();
                 }
             });

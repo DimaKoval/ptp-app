@@ -11,6 +11,10 @@ pub enum Resolution {
     P2160,
 }
 
+/// Widest frame the H.264 hardware encoders accept (VideoToolbox, NVENC,
+/// AMF and Quick Sync all stop at 4096).
+pub const MAX_ENCODE_WIDTH: u32 = 4096;
+
 impl Resolution {
     pub const ALL: [Resolution; 4] = [Resolution::P720, Resolution::P1080, Resolution::P1440, Resolution::P2160];
 
@@ -23,14 +27,19 @@ impl Resolution {
         }
     }
 
-    /// Bounding box the captured image is scaled to fit (keeps aspect ratio).
+    /// Box the captured image is scaled down to fit (keeps aspect ratio,
+    /// never upscales). The preset sets the height ("1440p" = 1440 lines);
+    /// width is free up to the H.264 hardware encoders' limit, so a 32:9
+    /// ultrawide isn't squeezed into a 16:9 box (5120×1440 at "4K" used to
+    /// come out as 3840×1080; now 4096×1152).
     pub fn bounds(self) -> (u32, u32) {
-        match self {
-            Resolution::P720 => (1280, 720),
-            Resolution::P1080 => (1920, 1080),
-            Resolution::P1440 => (2560, 1440),
-            Resolution::P2160 => (3840, 2160),
-        }
+        let lines = match self {
+            Resolution::P720 => 720,
+            Resolution::P1080 => 1080,
+            Resolution::P1440 => 1440,
+            Resolution::P2160 => 2160,
+        };
+        (MAX_ENCODE_WIDTH, lines)
     }
 
     /// Reasonable H.264 bitrate for screen content (Mbps) at a given fps.
