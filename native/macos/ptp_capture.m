@@ -234,6 +234,9 @@ int ptp_thumbnail(uint32_t kind, uint32_t sid, uint32_t max_w, uint32_t max_h, u
 
 // ───────────────────────────── session ─────────────────────────────
 
+#define LB_SAMPLES 6   // samples (100 ms apart) bars must be stable for
+#define LB_RECALL 2    // samples needed to re-apply a remembered crop
+
 @interface PTPSession : NSObject <SCStreamOutput, SCStreamDelegate> {
   @public
     ptp_config _cfg;
@@ -252,10 +255,20 @@ int ptp_thumbnail(uint32_t kind, uint32_t sid, uint32_t max_w, uint32_t max_h, u
     uint32_t _encW, _encH;       // encoder size while _lbOn
     VTPixelTransferSessionRef _xfer;
     CVPixelBufferPoolRef _lbPool;
-    int _lbT[8], _lbB[8], _lbL[8], _lbR[8];
+    int _lbT[LB_SAMPLES], _lbB[LB_SAMPLES], _lbL[LB_SAMPLES], _lbR[LB_SAMPLES];
     int _lbSpill;                // consecutive samples with picture past the crop edge
     int _lbN, _lbPos;
     int64_t _lbLastUs;
+    // Crop only while the shared window (or, for a screen, the window on top)
+    // covers a whole display, i.e. is fullscreen.
+    BOOL _lbAllowed;
+    int64_t _fsCheckUs;
+    CGDirectDisplayID _displayId;
+    int _lbInset;                // screen sharing: rows above the fullscreen app (notch strip)
+    // Last crop applied at this capture size: the same bars coming back
+    // (e.g. re-entering fullscreen) are cropped again after 2 samples.
+    CGRect _lbMemory;
+    uint32_t _lbMemW, _lbMemH;
     // window sources: follow the window's size
     BOOL _isWindow;
     uint32_t _windowId;
@@ -441,8 +454,8 @@ static void bar_stats(const int *v, int n, int *mn, int *mx) {
 }
 
 // Bars on one axis count only if both sides are similar (a centred picture),
-// at least 2% of the frame, and unchanged for the whole 1.6 s window, so dark
-// scenes or a terminal's black background are not mistaken for bars.
+// at least 2% of the frame, and unchanged across all samples given, so dark
+// scenes are not mistaken for bars.
 static int stable_bar(const int *a, const int *b, int n, int extent) {
     int amn, amx, bmn, bmx;
     bar_stats(a, n, &amn, &amx);
@@ -455,7 +468,6 @@ static int stable_bar(const int *a, const int *b, int n, int extent) {
     return (m + 2) & ~1;
 }
 
-// Called on videoQueue for every captured frame; samples 4×/s.
 // Fraction of 16 points along a line (row y, or column x) that are not black.
 static double line_fill(CVPixelBufferRef pb, BOOL row, int at, int from, int to) {
     if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return 0;
@@ -471,11 +483,122 @@ static double line_fill(CVPixelBufferRef pb, BOOL row, int at, int from, int to)
     return lit / 16.0;
 }
 
-// Called on videoQueue for every captured frame; samples 5×/s. Bars must be
-// stable for 1.6 s before cropping.
-- (void)checkLetterbox:(CVPixelBufferRef)pb {
+// Height of the area above a fullscreen app (the camera notch on MacBooks), points.
+static double notch_inset(CGDirectDisplayID did) {
+    if (@available(macOS 12.0, *)) {
+        for (NSScreen *scr in NSScreen.screens) {
+            NSNumber *n = scr.deviceDescription[@"NSScreenNumber"];
+            if (n && n.unsignedIntValue == did) return scr.safeAreaInsets.top;
+        }
+    }
+    return 0;
+}
+
+// Whether window bounds b fill display d the way a fullscreen app does: the
+// whole display, or all of it below the notch. Sets *top to the gap above.
+static BOOL fills_display(CGRect b, CGDirectDisplayID did, double *top) {
+    CGRect d = CGDisplayBounds(did);
+    double gap = b.origin.y - d.origin.y;
+    if (gap > 2 && gap > notch_inset(did) + 2) return NO;
+    if (b.origin.x > d.origin.x + 2 || CGRectGetMaxX(b) < CGRectGetMaxX(d) - 2 || CGRectGetMaxY(b) < CGRectGetMaxY(d) - 2) return NO;
+    if (top) *top = gap > 2 ? gap : 0;
+    return YES;
+}
+
+static BOOL covers_display(CGRect b, CGDirectDisplayID *which) {
+    CGDirectDisplayID ids[16];
+    uint32_t count = 0;
+    CGGetActiveDisplayList(16, ids, &count);
+    for (uint32_t i = 0; i < count; i++) {
+        if (fills_display(b, ids[i], NULL)) {
+            if (which) *which = ids[i];
+            return YES;
+        }
+    }
+    return NO;
+}
+
+// Is the shared window fullscreen, or (sharing a screen) the topmost normal
+// window on that screen? Black bars are cropped only then. On videoQueue.
+- (void)checkFullscreen {
     int64_t now = host_time_us();
-    if (now - _lbLastUs < 200000) return;
+    if (now - _fsCheckUs < 200000) return;
+    _fsCheckUs = now;
+    BOOL fs = NO;
+    int inset = 0;
+    if (_isWindow) {
+        CFArrayRef list = CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow, _windowId);
+        if (list) {
+            CGRect b;
+            if (CFArrayGetCount(list) > 0) {
+                CFDictionaryRef bd = CFDictionaryGetValue(CFArrayGetValueAtIndex(list, 0), kCGWindowBounds);
+                fs = bd && CGRectMakeWithDictionaryRepresentation(bd, &b) && covers_display(b, NULL);
+            }
+            CFRelease(list);
+        }
+    } else if (_displayId) {
+        CGRect d = CGDisplayBounds(_displayId);
+        CFArrayRef list = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
+        if (list) {
+            // Front to back: the first sizeable normal window on this display decides.
+            for (CFIndex i = 0; i < CFArrayGetCount(list); i++) {
+                CFDictionaryRef w = CFArrayGetValueAtIndex(list, i);
+                int layer = -1;
+                CFNumberRef ln = CFDictionaryGetValue(w, kCGWindowLayer);
+                if (!ln || !CFNumberGetValue(ln, kCFNumberIntType, &layer) || layer != 0) continue;
+                CGRect b;
+                CFDictionaryRef bd = CFDictionaryGetValue(w, kCGWindowBounds);
+                if (!bd || !CGRectMakeWithDictionaryRepresentation(bd, &b)) continue;
+                CGRect inter = CGRectIntersection(b, d);
+                if (CGRectIsNull(inter)) continue;
+                // Skip helper windows (tooltips, Chrome's status bubble...):
+                // invisible, or under 10% of the screen.
+                double alpha = 1;
+                CFNumberRef an = CFDictionaryGetValue(w, kCGWindowAlpha);
+                if (an) CFNumberGetValue(an, kCFNumberDoubleType, &alpha);
+                if (alpha < 0.1 || inter.size.width * inter.size.height < d.size.width * d.size.height * 0.1) continue;
+                double top = 0;
+                fs = fills_display(b, _displayId, &top);
+                // The strip above the app is part of the shared screen: rows
+                // in capture pixels, left out when measuring the bars.
+                if (fs && top > 0) inset = (int)ceil(top * _height / d.size.height);
+                if (getenv("PTP_DEBUG_FS")) {
+                    NSString *owner = (__bridge NSString *)CFDictionaryGetValue(w, kCGWindowOwnerName);
+                    fprintf(stderr, "dbg fs top window %s %.0f,%.0f %.0fx%.0f display %.0f,%.0f %.0fx%.0f\n", owner.UTF8String ?: "?",
+                            b.origin.x, b.origin.y, b.size.width, b.size.height, d.origin.x, d.origin.y, d.size.width, d.size.height);
+                }
+                break;
+            }
+            CFRelease(list);
+        }
+    }
+    if (fs == _lbAllowed && inset == _lbInset) return;
+    _lbAllowed = fs;
+    _lbInset = inset;
+    _lbN = _lbPos = 0;
+    if (getenv("PTP_DEBUG")) fprintf(stderr, "dbg fullscreen %s\n", fs ? "yes" : "no");
+    if (!fs && _lbOn) [self setLetterbox:CGRectNull];
+}
+
+// Crop rect for bars of v rows (top and bottom) and h columns (each side),
+// below `inset` rows at the top that are cut off too.
+static CGRect lb_rect(int v, int h, int W, int H, int inset) {
+    int top = (v + inset + 1) & ~1;
+    return CGRectMake(h, top, (W - 2 * h) & ~1, (H - top - v) & ~1);
+}
+
+// The last k samples of a ring, oldest first.
+static void last_samples(const int *ring, int pos, int k, int *out) {
+    for (int i = 0; i < k; i++) out[i] = ring[(pos - k + i + LB_SAMPLES) % LB_SAMPLES];
+}
+
+// Called on videoQueue for captured frames and, from the timer, for the last
+// frame (a paused picture sends no new frames); samples 10×/s. Bars must be
+// stable for 0.6 s, or 0.2 s if they match the last crop at this size.
+- (void)checkLetterbox:(CVPixelBufferRef)pb {
+    if (!_lbAllowed) return;
+    int64_t now = host_time_us();
+    if (now - _lbLastUs < 100000) return;
     _lbLastUs = now;
     int W = (int)CVPixelBufferGetWidth(pb), H = (int)CVPixelBufferGetHeight(pb);
 
@@ -492,7 +615,7 @@ static double line_fill(CVPixelBufferRef pb, BOOL row, int at, int from, int to)
         if (x0 >= 8)
             spill |= line_fill(pb, NO, x0 - 6, y0, y1) >= 0.5 || line_fill(pb, NO, x1 + 5, y0, y1) >= 0.5;
         _lbSpill = spill ? _lbSpill + 1 : 0;
-        if (_lbSpill >= 2) {
+        if (_lbSpill >= 3) {
             _lbN = _lbPos = 0;
             _lbSpill = 0;
             [self setLetterbox:CGRectNull];
@@ -501,14 +624,40 @@ static double line_fill(CVPixelBufferRef pb, BOOL row, int at, int from, int to)
     }
     int t, b, l, r;
     if (!measure_bars(pb, &t, &b, &l, &r)) return;
+    t = t > _lbInset ? t - _lbInset : 0;
     _lbT[_lbPos] = t; _lbB[_lbPos] = b; _lbL[_lbPos] = l; _lbR[_lbPos] = r;
-    _lbPos = (_lbPos + 1) % 8;
-    if (_lbN < 8) _lbN++;
-    if (_lbN < 8) return;
-    int v = stable_bar(_lbT, _lbB, 8, H);
-    int h = stable_bar(_lbL, _lbR, 8, W);
+    _lbPos = (_lbPos + 1) % LB_SAMPLES;
+    if (_lbN < LB_SAMPLES) _lbN++;
+
+    int k = _lbN;
+    BOOL remembered = !CGRectIsNull(_lbMemory) && _lbMemW == (uint32_t)W && _lbMemH == (uint32_t)H;
+    if (k < (remembered ? LB_RECALL : LB_SAMPLES)) return;
+    if (k > LB_SAMPLES) k = LB_SAMPLES;
+    int st[LB_SAMPLES], sb[LB_SAMPLES], sl[LB_SAMPLES], sr[LB_SAMPLES];
+    if (remembered) {
+        last_samples(_lbT, _lbPos, LB_RECALL, st);
+        last_samples(_lbB, _lbPos, LB_RECALL, sb);
+        last_samples(_lbL, _lbPos, LB_RECALL, sl);
+        last_samples(_lbR, _lbPos, LB_RECALL, sr);
+        int v = stable_bar(st, sb, LB_RECALL, H - _lbInset), h = stable_bar(sl, sr, LB_RECALL, W);
+        if ((v || h) && CGRectEqualToRect(lb_rect(v, h, W, H, _lbInset), _lbMemory)) {
+            [self setLetterbox:_lbMemory];
+            return;
+        }
+        if (k < LB_SAMPLES) return;
+    }
+    last_samples(_lbT, _lbPos, LB_SAMPLES, st);
+    last_samples(_lbB, _lbPos, LB_SAMPLES, sb);
+    last_samples(_lbL, _lbPos, LB_SAMPLES, sl);
+    last_samples(_lbR, _lbPos, LB_SAMPLES, sr);
+    int v = stable_bar(st, sb, LB_SAMPLES, H - _lbInset);
+    int h = stable_bar(sl, sr, LB_SAMPLES, W);
     if (!v && !h) return;
-    [self setLetterbox:CGRectMake(h, v, (W - 2 * h) & ~1, (H - 2 * v) & ~1)];
+    CGRect crop = lb_rect(v, h, W, H, _lbInset);
+    _lbMemory = crop;
+    _lbMemW = W;
+    _lbMemH = H;
+    [self setLetterbox:crop];
 }
 
 - (void)setLetterbox:(CGRect)crop {
@@ -559,7 +708,10 @@ static double line_fill(CVPixelBufferRef pb, BOOL row, int at, int from, int to)
 - (void)tick {
     if (atomic_load(&_stopped)) return;
     if (_isWindow) [self checkWindowSize];
+    [self checkFullscreen];
     if (!_lastFrame) return;
+    if (CVPixelBufferGetWidth(_lastFrame) == _width && CVPixelBufferGetHeight(_lastFrame) == _height)
+        [self checkLetterbox:_lastFrame];
     int64_t idle = host_time_us() - _lastEncodeUs;
     if (idle > 500000 || (atomic_load(&_forceKey) && idle > 40000)) [self encode:_lastFrame];
 }
@@ -1089,6 +1241,8 @@ void *ptp_start(const ptp_config *cfg, uint32_t *out_width, uint32_t *out_height
         s->_candCrop = CGRectNull;
         s->_isWindow = cfg->source_kind == PTP_SOURCE_WINDOW;
         s->_windowId = cfg->source_id;
+        s->_displayId = cfg->source_kind == PTP_SOURCE_DISPLAY ? cfg->source_id : 0;
+        s->_lbMemory = CGRectNull;
         s.videoStream = [[SCStream alloc] initWithFilter:vfilter configuration:vc delegate:s];
         if (![s.videoStream addStreamOutput:s type:SCStreamOutputTypeScreen sampleHandlerQueue:s.videoQueue error:&ne]) {
             set_err(err, err_len, ne.localizedDescription);
